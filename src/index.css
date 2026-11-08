@@ -1,0 +1,318 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+  }
+}
+
+/* Custom subtle scrollbars for dark & light scientific themes */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #090d16;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1e293b;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #334155;
+}
+
+html.light ::-webkit-scrollbar-track {
+  background: #f8fafc;
+}
+
+html.light ::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+
+html.light ::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* ==========================================================================
+   Academic Light Theme Overrides (html.light)
+   ========================================================================== */
+html.light body,
+html.light .bg-slate-950,
+html.light .bg-\[\#090d16\] {
+  background-color: #f8fafc !important;
+  color: #0f172a !important;
+}
+
+html.light .bg-slate-950\/80,
+html.light .bg-slate-950\/70,
+html.light .bg-slate-950\/60,
+html.light .bg-slate-950\/90 {
+  background-color: #f1f5f9 !important;
+  color: #0f172a !important;
+}
+
+html.light .bg-slate-900,
+html.light .bg-slate-900\/95,
+html.light .bg-slate-900\/90,
+html.light .bg-slate-900\/85,
+html.light .bg-slate-900\/80,
+html.light .bg-slate-900\/50 {
+  background-color: #ffffff !important;
+  color: #0f172a !important;
+}
+
+html.light .bg-slate-800,
+html.light .bg-slate-800\/90,
+html.light .bg-slate-800\/80,
+html.light .bg-slate-800\/70,
+html.light .bg-slate-800\/60 {
+  background-color: #e2e8f0 !important;
+  color: #1e293b !important;
+}
+
+html.light .hover\:bg-slate-800:hover,
+html.light .hover\:bg-slate-800\/80:hover,
+html.light .hover\:bg-slate-800\/70:hover,
+html.light .hover\:bg-slate-700:hover {
+  background-color: #cbd5e1 !important;
+}
+
+html.light .border-slate-800,
+html.light .border-slate-800\/80,
+html.light .border-slate-800\/90,
+html.light .border-slate-800\/60,
+html.light .border-slate-700,
+html.light .border-slate-700\/80,
+html.light .border-slate-700\/60 {
+  border-color: #cbd5e1 !important;
+}
+
+html.light .text-slate-100,
+html.light .text-slate-200 {
+  color: #0f172a !important;
+}
+
+html.light .text-slate-300 {
+  color: #1e293b !important;
+}
+
+html.light .text-slate-400,
+html.light .text-slate-500 {
+  color: #475569 !important;
+}
+
+html.light .text-indigo-200,
+html.light .text-indigo-300 {
+  color: #4338ca !important;
+}
+
+html.light .text-emerald-200,
+html.light .text-emerald-300,
+html.light .text-emerald-400 {
+  color: #047857 !important;
+}
+
+html.light .text-sky-200,
+html.light .text-sky-300,
+html.light .text-sky-400 {
+  color: #0369a1 !important;
+}
+
+html.light .text-amber-300,
+html.light .text-amber-400 {
+  color: #b45309 !important;
+}
+
+html.light .from-slate-950 {
+  --tw-gradient-from: #f8fafc var(--tw-gradient-from-position) !important;
+}
+html.light .via-slate-900\/60 {
+  --tw-gradient-via: #f1f5f9 var(--tw-gradient-via-position) !important;
+}
+html.light .to-slate-950 {
+  --tw-gradient-to: #e2e8f0 var(--tw-gradient-to-position) !important;
+}
+
+/* ==========================================================================
+   Overleaf-Style Visual Editor (WYSIWYM) Decorations
+   ========================================================================== */
+.cm-visual-title {
+  font-size: 1.55em;
+  font-weight: 800;
+  color: #a5b4fc;
+  letter-spacing: -0.02em;
+  font-family: Inter, system-ui, -apple-system, sans-serif;
+}
+
+html.light .cm-visual-title {
+  color: #312e81;
+}
+
+.cm-visual-h1 {
+  font-size: 1.35em;
+  font-weight: 700;
+  color: #e2e8f0;
+  border-bottom: 1px solid rgba(99, 102, 241, 0.3);
+  padding-bottom: 2px;
+  font-family: Inter, system-ui, -apple-system, sans-serif;
+}
+
+html.light .cm-visual-h1 {
+  color: #0f172a;
+  border-bottom-color: rgba(79, 70, 229, 0.25);
+}
+
+.cm-visual-h2 {
+  font-size: 1.18em;
+  font-weight: 600;
+  color: #cbd5e1;
+  font-family: Inter, system-ui, -apple-system, sans-serif;
+}
+
+html.light .cm-visual-h2 {
+  color: #1e293b;
+}
+
+.cm-visual-h3 {
+  font-size: 1.05em;
+  font-weight: 600;
+  color: #94a3b8;
+  font-style: italic;
+  font-family: Inter, system-ui, -apple-system, sans-serif;
+}
+
+html.light .cm-visual-h3 {
+  color: #334155;
+}
+
+.cm-visual-bold {
+  font-weight: 700;
+  color: #f8fafc;
+}
+
+html.light .cm-visual-bold {
+  color: #0f172a;
+}
+
+.cm-visual-italic {
+  font-style: italic;
+  color: #e2e8f0;
+}
+
+html.light .cm-visual-italic {
+  color: #1e293b;
+}
+
+.cm-visual-underline {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.cm-visual-cite-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 0px 6px;
+  margin: 0 2px;
+  border-radius: 4px;
+  font-size: 0.85em;
+  font-weight: 600;
+  font-family: Inter, system-ui, sans-serif;
+  background-color: rgba(99, 102, 241, 0.18);
+  color: #a5b4fc;
+  border: 1px solid rgba(99, 102, 241, 0.35);
+  cursor: pointer;
+}
+
+html.light .cm-visual-cite-pill {
+  background-color: rgba(79, 70, 229, 0.12);
+  color: #4338ca;
+  border-color: rgba(79, 70, 229, 0.3);
+}
+
+.cm-visual-item-bullet {
+  display: inline-block;
+  color: #818cf8;
+  font-weight: 800;
+  padding: 0 6px;
+  cursor: pointer;
+}
+
+.cm-visual-math-inline {
+  display: inline-block;
+  padding: 1px 5px;
+  margin: 0 1px;
+  border-radius: 4px;
+  background-color: rgba(99, 102, 241, 0.1);
+  border: 1px solid rgba(99, 102, 241, 0.22);
+  cursor: pointer;
+  vertical-align: middle;
+  transition: background-color 0.15s ease;
+}
+
+.cm-visual-math-inline:hover {
+  background-color: rgba(99, 102, 241, 0.22);
+}
+
+html.light .cm-visual-math-inline {
+  background-color: rgba(79, 70, 229, 0.07);
+  border-color: rgba(79, 70, 229, 0.2);
+}
+
+.cm-visual-math-block {
+  display: block;
+  padding: 10px 16px;
+  margin: 6px 0;
+  border-radius: 8px;
+  background-color: rgba(15, 23, 42, 0.75);
+  border: 1px solid rgba(99, 102, 241, 0.28);
+  text-align: center;
+  cursor: pointer;
+  overflow-x: auto;
+}
+
+.cm-visual-math-block:hover {
+  border-color: rgba(99, 102, 241, 0.55);
+}
+
+html.light .cm-visual-math-block {
+  background-color: #f1f5f9;
+  border-color: #cbd5e1;
+}
+
+.cm-visual-preamble-banner {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  margin: 2px 0;
+  border-radius: 6px;
+  font-family: Inter, system-ui, sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  background: linear-gradient(90deg, rgba(79, 70, 229, 0.18), rgba(6, 182, 212, 0.12));
+  color: #a5b4fc;
+  border: 1px dashed rgba(99, 102, 241, 0.45);
+  cursor: pointer;
+  user-select: none;
+}
+
+.cm-visual-preamble-banner:hover {
+  background: linear-gradient(90deg, rgba(79, 70, 229, 0.28), rgba(6, 182, 212, 0.2));
+}
+
+html.light .cm-visual-preamble-banner {
+  color: #3730a3;
+  border-color: rgba(79, 70, 229, 0.4);
+}
