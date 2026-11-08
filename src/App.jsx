@@ -36,6 +36,14 @@ import Navbar from './components/Navbar';
 import Sidebar from './components/Sidebar';
 import EditorPane from './components/EditorPane';
 import PdfPreview from './components/PdfPreview';
+import PreFlightModal from './components/PreFlightModal';
+import {
+  countReviewItems,
+  scanReviewItems,
+  sanitizeTexForSubmission,
+  createCleanSubmissionZipBlob,
+  triggerFileDownload,
+} from './utils/reviewMacroUtils';
 import {
   createCollabSession,
   getRoomFromUrlHash,
@@ -345,6 +353,39 @@ export default function App() {
   const [missingAssetsModalOpen, setMissingAssetsModalOpen] = useState(false);
   const [missingAssetsList, setMissingAssetsList] = useState([]);
   const [isAuthorizingMissing, setIsAuthorizingMissing] = useState(false);
+
+  // Review Mode, Track Changes & Pre-Flight Journal Submission Export State
+  const [isReviewPanelOpen, setIsReviewPanelOpen] = useState(false);
+  const [reviewTargetItem, setReviewTargetItem] = useState(null);
+  const [reviewItems, setReviewItems] = useState([]);
+  const [triggerAddCommentKey, setTriggerAddCommentKey] = useState(0);
+  const [isTrackingChanges, setIsTrackingChanges] = useState(() => {
+    try {
+      return localStorage.getItem('opendrivetex_track_changes') === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  const handleToggleTrackChanges = useCallback(() => {
+    setIsTrackingChanges((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('opendrivetex_track_changes', String(next));
+      } catch {}
+      return next;
+    });
+  }, []);
+
+  const handleTriggerAddComment = useCallback(() => {
+    setTriggerAddCommentKey((k) => k + 1);
+  }, []);
+
+  const [preFlightModalState, setPreFlightModalState] = useState({
+    isOpen: false,
+    exportType: 'tex',
+    counts: { comments: 0, additions: 0, deletions: 0, total: 0 },
+  });
 
   /**
    * Dedicated background Web Worker reference (`src/workers/latex.worker.js`).
@@ -2283,6 +2324,130 @@ export default function App() {
   }, [executeLeaderDrivePatch]);
 
   /**
+   * Scans target text or all project files for pending review items.
+   */
+  const checkPendingReviewItems = useCallback((targetType = 'tex') => {
+    const currentSession = collabSessionRef.current;
+    if (!currentSession) {
+      return { comments: 0, additions: 0, deletions: 0, total: 0, items: [] };
+    }
+
+    const mainText = currentSession.ytext.toString();
+    const mainItems = scanReviewItems(mainText);
+
+    if (targetType === 'tex') {
+      return { ...countReviewItems(mainText), items: mainItems };
+    }
+
+    let comments = 0;
+    let additions = 0;
+    let deletions = 0;
+    const allItems = [...mainItems];
+
+    for (const item of mainItems) {
+      if (item.type === 'comment') comments++;
+      else if (item.type === 'add') additions++;
+      else if (item.type === 'del') deletions++;
+    }
+
+    if (currentSession.auxFilesMap) {
+      const iterate = (fn) => {
+        if (typeof currentSession.auxFilesMap.forEach === 'function') {
+          currentSession.auxFilesMap.forEach(fn);
+        } else {
+          Object.entries(currentSession.auxFilesMap).forEach(([k, v]) => fn(v, k));
+        }
+      };
+
+      iterate((entry, path) => {
+        if (path && path.endsWith('.tex')) {
+          let text = '';
+          if (typeof entry?.content === 'string') text = entry.content;
+          else if (entry?.content instanceof Uint8Array) {
+            text = new TextDecoder('utf-8').decode(entry.content);
+          }
+          const auxItems = scanReviewItems(text);
+          allItems.push(...auxItems);
+          for (const item of auxItems) {
+            if (item.type === 'comment') comments++;
+            else if (item.type === 'add') additions++;
+            else if (item.type === 'del') deletions++;
+          }
+        }
+      });
+    }
+
+    return {
+      comments,
+      additions,
+      deletions,
+      total: comments + additions + deletions,
+      items: allItems,
+    };
+  }, []);
+
+  /**
+   * Executes the actual clean .tex download.
+   */
+  const executeCleanTexDownload = useCallback(() => {
+    const currentSession = collabSessionRef.current;
+    if (!currentSession) return;
+    const cleanTex = sanitizeTexForSubmission(currentSession.ytext.toString());
+    const downloadName = (driveFileName || 'manuscript.tex').endsWith('.tex')
+      ? driveFileName || 'manuscript.tex'
+      : `${driveFileName}.tex`;
+    triggerFileDownload(cleanTex, downloadName, 'text/x-tex;charset=utf-8');
+  }, [driveFileName]);
+
+  /**
+   * Executes the actual clean project .zip download.
+   */
+  const executeCleanZipDownload = useCallback(async () => {
+    const currentSession = collabSessionRef.current;
+    if (!currentSession) return;
+    const zipBlob = await createCleanSubmissionZipBlob(
+      driveFolderName || 'project',
+      driveFileName || 'main.tex',
+      currentSession.ytext.toString(),
+      currentSession.auxFilesMap
+    );
+    const projectName = (driveFolderName || 'manuscript').replace(/[^a-zA-Z0-9_-]/g, '_');
+    triggerFileDownload(zipBlob, `${projectName}-submission.zip`, 'application/zip');
+  }, [driveFolderName, driveFileName]);
+
+  /**
+   * Initiates Clean .tex Export with Pre-Flight Check.
+   */
+  const handleExportSubmissionTex = useCallback(() => {
+    const check = checkPendingReviewItems('tex');
+    if (check.total > 0) {
+      setPreFlightModalState({
+        isOpen: true,
+        exportType: 'tex',
+        counts: check,
+      });
+    } else {
+      executeCleanTexDownload();
+    }
+  }, [checkPendingReviewItems, executeCleanTexDownload]);
+
+  /**
+   * Initiates Clean Project .zip Export with Pre-Flight Check.
+   */
+  const handleExportSubmissionZip = useCallback(() => {
+    const check = checkPendingReviewItems('zip');
+    if (check.total > 0) {
+      setPreFlightModalState({
+        isOpen: true,
+        exportType: 'zip',
+        counts: check,
+      });
+    } else {
+      executeCleanZipDownload();
+    }
+  }, [checkPendingReviewItems, executeCleanZipDownload]);
+
+  /**
    * Offline local `.tex` source download.
    */
   const handleExportTex = useCallback(() => {
@@ -2463,6 +2628,9 @@ export default function App() {
         onManualSaveToDrive={handleManualSaveToDrive}
         onOpenFromDrive={() => handleOpenGooglePicker('folder')}
         onSelectDriveFolder={handleSelectDriveFolder}
+        onExportSubmissionTex={handleExportSubmissionTex}
+        onExportSubmissionZip={handleExportSubmissionZip}
+        onExportPdf={handleExportPdf}
       />
 
       {/* Main Split-Screen Workspace */}
@@ -2496,6 +2664,12 @@ export default function App() {
           onOpenGooglePicker={handleOpenGooglePicker}
           theme={theme}
           onToggleTheme={handleToggleTheme}
+          isTrackingChanges={isTrackingChanges}
+          onToggleTrackChanges={handleToggleTrackChanges}
+          onOpenAddComment={handleTriggerAddComment}
+          isReviewPanelOpen={isReviewPanelOpen}
+          onToggleReviewPanel={() => setIsReviewPanelOpen((prev) => !prev)}
+          reviewItemsCount={reviewItems.length}
         />
 
         {/* Center & Right Workspace OR Welcome / Open Drive Folder Screen */}
@@ -2556,6 +2730,14 @@ export default function App() {
                   theme={theme}
                   isPdfVisible={isPdfVisible}
                   onTogglePdfVisible={handleTogglePdfVisible}
+                  userProfile={userProfile}
+                  isReviewPanelOpen={isReviewPanelOpen}
+                  setIsReviewPanelOpen={setIsReviewPanelOpen}
+                  reviewTargetItem={reviewTargetItem}
+                  isTrackingChanges={isTrackingChanges}
+                  onToggleTrackChanges={handleToggleTrackChanges}
+                  triggerAddCommentKey={triggerAddCommentKey}
+                  onReviewItemsChange={setReviewItems}
                 />
               </div>
 
@@ -2900,6 +3082,31 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Pre-Flight Journal Submission Warning Modal */}
+      <PreFlightModal
+        isOpen={preFlightModalState.isOpen}
+        onClose={() => setPreFlightModalState((prev) => ({ ...prev, isOpen: false }))}
+        exportType={preFlightModalState.exportType}
+        counts={preFlightModalState.counts}
+        onStopAndReview={() => {
+          const firstPendingItem = preFlightModalState.counts?.items?.[0] || null;
+          setPreFlightModalState((prev) => ({ ...prev, isOpen: false }));
+          setIsReviewPanelOpen(true);
+          if (firstPendingItem) {
+            setReviewTargetItem(firstPendingItem);
+          }
+        }}
+        onAcceptAllAndDownload={() => {
+          const type = preFlightModalState.exportType;
+          setPreFlightModalState((prev) => ({ ...prev, isOpen: false }));
+          if (type === 'tex') {
+            executeCleanTexDownload();
+          } else {
+            executeCleanZipDownload();
+          }
+        }}
+      />
     </div>
   );
 }

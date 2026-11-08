@@ -19,6 +19,10 @@ import {
   CloudUpload,
   CheckCircle2,
   Crown,
+  Download,
+  ChevronDown,
+  FileText,
+  Archive,
 } from 'lucide-react';
 import { electSaveLeader } from '../services/collabService';
 
@@ -43,9 +47,29 @@ export default function Navbar({
   onManualSaveToDrive,
   onOpenFromDrive,
   onSelectDriveFolder,
+  onExportSubmissionTex,
+  onExportSubmissionZip,
+  onExportPdf,
 }) {
   const [peers, setPeers] = useState([]);
   const [leaderClientId, setLeaderClientId] = useState(null);
+  const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
+  const exportMenuRef = React.useRef(null);
+
+  // Close export menu on outside click
+  useEffect(() => {
+    const handleOutsideClick = (e) => {
+      if (exportMenuRef.current && !exportMenuRef.current.contains(e.target)) {
+        setIsExportMenuOpen(false);
+      }
+    };
+    if (isExportMenuOpen) {
+      document.addEventListener('mousedown', handleOutsideClick);
+    }
+    return () => {
+      document.removeEventListener('mousedown', handleOutsideClick);
+    };
+  }, [isExportMenuOpen]);
 
   useEffect(() => {
     if (!collabSession) {
@@ -331,6 +355,83 @@ export default function Navbar({
               </>
             )}
           </button>
+
+          {/* Export for Submission Dropdown */}
+          <div className="relative" ref={exportMenuRef}>
+            <button
+              type="button"
+              onClick={() => setIsExportMenuOpen((prev) => !prev)}
+              disabled={!collabSession}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                !collabSession
+                  ? 'bg-slate-800/60 text-slate-500 border-slate-700/60 cursor-not-allowed'
+                  : isExportMenuOpen
+                  ? 'bg-slate-800 text-white border-slate-600 shadow-sm cursor-pointer'
+                  : 'bg-slate-800/80 hover:bg-slate-700 text-slate-200 border-slate-700 cursor-pointer'
+              }`}
+              title="Export clean manuscript or project for journal submission"
+              data-testid="export-submission-dropdown"
+            >
+              <Download className="w-3.5 h-3.5 text-indigo-400" />
+              <span className="hidden sm:inline">Export</span>
+              <ChevronDown className="w-3 h-3 text-slate-400" />
+            </button>
+
+            {isExportMenuOpen && (
+              <div className="absolute right-0 top-full mt-1.5 w-64 rounded-xl bg-slate-900 border border-slate-800 shadow-2xl p-1.5 z-50 text-xs space-y-1 animate-fade-in">
+                <div className="px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                  Journal Submission
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsExportMenuOpen(false);
+                    onExportSubmissionTex && onExportSubmissionTex();
+                  }}
+                  className="w-full text-left px-2.5 py-2 rounded-lg hover:bg-slate-800 flex items-center gap-2.5 text-slate-200 transition-colors cursor-pointer"
+                >
+                  <FileText className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <div>
+                    <div className="font-semibold text-slate-100">Clean .tex File</div>
+                    <div className="text-[10px] text-slate-400">
+                      Current file without review tags
+                    </div>
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsExportMenuOpen(false);
+                    onExportSubmissionZip && onExportSubmissionZip();
+                  }}
+                  className="w-full text-left px-2.5 py-2 rounded-lg hover:bg-slate-800 flex items-center gap-2.5 text-slate-200 transition-colors cursor-pointer"
+                >
+                  <Archive className="w-4 h-4 text-indigo-400 shrink-0" />
+                  <div>
+                    <div className="font-semibold text-slate-100">Clean Project .zip</div>
+                    <div className="text-[10px] text-slate-400">
+                      All figures, bib & sanitized .tex
+                    </div>
+                  </div>
+                </button>
+                <div className="h-px bg-slate-800 my-1" />
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsExportMenuOpen(false);
+                    onExportPdf && onExportPdf();
+                  }}
+                  className="w-full text-left px-2.5 py-2 rounded-lg hover:bg-slate-800 flex items-center gap-2.5 text-slate-200 transition-colors cursor-pointer"
+                >
+                  <Download className="w-4 h-4 text-cyan-400 shrink-0" />
+                  <div>
+                    <div className="font-semibold text-slate-100">Compiled PDF</div>
+                    <div className="text-[10px] text-slate-400">Download current PDF build</div>
+                  </div>
+                </button>
+              </div>
+            )}
+          </div>
 
           {/* Compile LaTeX via Web Worker */}
           <button

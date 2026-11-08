@@ -7,7 +7,7 @@
  * CodeMirror `EditorView` once per active file session via `useRef`.
  */
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import * as Y from 'yjs';
 import { Compartment, EditorState } from '@codemirror/state';
 import {
@@ -43,9 +43,21 @@ import {
   Code2,
   PanelRightClose,
   PanelRightOpen,
+  MessageSquare,
+  MessageSquarePlus,
+  Sparkles,
 } from 'lucide-react';
 import { inferImageMimeType, isImageAssetFile } from '../services/driveService';
-import { visualEditorExtension } from '../utils/visualEditorExtension';
+import { visualEditorExtension, auxFilesFacet } from '../utils/visualEditorExtension';
+import {
+  reviewExtension,
+  trackChangesFacet,
+  reviewUserFacet,
+  insertCommentInView,
+} from '../extensions/reviewExtension';
+import { scanReviewItems } from '../utils/reviewMacroUtils';
+import ReviewPanel from './ReviewPanel';
+import CommentModal from './CommentModal';
 
 /**
  * Formats a byte size into a human-readable string (`B`, `KB`, `MB`).
@@ -188,17 +200,78 @@ export default function EditorPane({
   theme = 'dark',
   isPdfVisible = true,
   onTogglePdfVisible,
+  userProfile = null,
+  isReviewPanelOpen: controlledReviewPanelOpen,
+  setIsReviewPanelOpen: setControlledReviewPanelOpen,
+  reviewTargetItem = null,
+  isTrackingChanges: controlledTrackingChanges,
+  onToggleTrackChanges: controlledToggleTrackChanges,
+  triggerAddCommentKey = 0,
+  onReviewItemsChange = null,
 }) {
   const editorContainerRef = useRef(null);
   const editorViewRef = useRef(null);
   const visualCompartmentRef = useRef(new Compartment());
   const themeCompartmentRef = useRef(new Compartment());
+  const trackChangesCompartmentRef = useRef(new Compartment());
+  const reviewUserCompartmentRef = useRef(new Compartment());
 
   const onCompileShortcutRef = useRef(onCompileShortcut);
   onCompileShortcutRef.current = onCompileShortcut;
 
   const onSaveShortcutRef = useRef(onSaveShortcut);
   onSaveShortcutRef.current = onSaveShortcut;
+
+  // Active authenticated Google user profile (or awareness collaborator)
+  const activeUser = useMemo(
+    () => ({
+      name:
+        userProfile?.name ||
+        collabSession?.provider?.awareness?.getLocalState()?.user?.name ||
+        'Google Researcher',
+      email:
+        userProfile?.email ||
+        collabSession?.provider?.awareness?.getLocalState()?.user?.email ||
+        '',
+      picture:
+        userProfile?.picture ||
+        collabSession?.provider?.awareness?.getLocalState()?.user?.picture ||
+        '',
+    }),
+    [userProfile?.name, userProfile?.email, userProfile?.picture, collabSession]
+  );
+
+  // Track Changes (Suggesting Mode) state
+  const [internalTrackingChanges, setInternalTrackingChanges] = useState(() => {
+    try {
+      return localStorage.getItem('opendrivetex_track_changes') === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  const isTrackingChanges =
+    controlledTrackingChanges !== undefined
+      ? controlledTrackingChanges
+      : internalTrackingChanges;
+  const setIsTrackingChanges =
+    controlledToggleTrackChanges || setInternalTrackingChanges;
+
+  // In-Editor Review Comment Modal state
+  const [isCommentModalOpen, setIsCommentModalOpen] = useState(false);
+  const [commentSelectedText, setCommentSelectedText] = useState('');
+
+  // Review & Comments panel state (internal fallback if not controlled)
+  const [uncontrolledReviewPanelOpen, setUncontrolledReviewPanelOpen] = useState(false);
+  const isReviewPanelOpen =
+    controlledReviewPanelOpen !== undefined
+      ? controlledReviewPanelOpen
+      : uncontrolledReviewPanelOpen;
+  const setIsReviewPanelOpen =
+    setControlledReviewPanelOpen || setUncontrolledReviewPanelOpen;
+
+  // Active review items scanned from current document text
+  const [reviewItems, setReviewItems] = useState([]);
 
   // Local Visual Editor vs Code Editor mode (local per user)
   const [editorMode, setEditorMode] = useState(() => {
@@ -325,7 +398,9 @@ export default function EditorPane({
 
     const isTexFile = activeFileName.endsWith('.tex');
     const initialVisualExt =
-      editorMode === 'visual' && isTexFile ? visualEditorExtension : [];
+      editorMode === 'visual' && isTexFile
+        ? [visualEditorExtension, auxFilesFacet.of(collabSession?.auxFilesMap || null)]
+        : [];
     const initialThemeExt =
       theme === 'light'
         ? [scientificLightEditorTheme]
@@ -348,6 +423,13 @@ export default function EditorPane({
         latex(),
         themeCompartmentRef.current.of(initialThemeExt),
         visualCompartmentRef.current.of(initialVisualExt),
+        trackChangesCompartmentRef.current.of(
+          isTexFile ? trackChangesFacet.of(isTrackingChanges) : []
+        ),
+        reviewUserCompartmentRef.current.of(
+          isTexFile ? reviewUserFacet.of(activeUser) : []
+        ),
+        isTexFile ? reviewExtension : [],
         EditorView.lineWrapping,
         keymap.of([
           {
@@ -386,13 +468,68 @@ export default function EditorPane({
 
     editorViewRef.current = view;
 
+    // Observe review items in Y.Text in real-time
+    const syncReviewItems = () => {
+      const items = isTexFile ? scanReviewItems(targetYText.toString()) : [];
+      setReviewItems(items);
+      if (onReviewItemsChange) {
+        onReviewItemsChange(items);
+      }
+    };
+    syncReviewItems();
+    targetYText.observe(syncReviewItems);
+
     return () => {
+      targetYText.unobserve(syncReviewItems);
       undoManager.destroy();
       view.destroy();
       editorViewRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [collabSession, activeFileName, isImageView]);
+
+  // Dynamically reconfigure Track Changes mode
+  useEffect(() => {
+    const view = editorViewRef.current;
+    if (!view) return;
+    const isTexFile = activeFileName.endsWith('.tex');
+    view.dispatch({
+      effects: trackChangesCompartmentRef.current.reconfigure(
+        isTexFile ? trackChangesFacet.of(isTrackingChanges) : []
+      ),
+    });
+    try {
+      localStorage.setItem('opendrivetex_track_changes', String(isTrackingChanges));
+    } catch {
+      // Ignore storage errors
+    }
+  }, [isTrackingChanges, activeFileName]);
+
+  // Dynamically reconfigure review user metadata
+  useEffect(() => {
+    const view = editorViewRef.current;
+    if (!view) return;
+    const isTexFile = activeFileName.endsWith('.tex');
+    view.dispatch({
+      effects: reviewUserCompartmentRef.current.reconfigure(
+        isTexFile ? reviewUserFacet.of(activeUser) : []
+      ),
+    });
+  }, [activeUser, activeFileName]);
+
+  // Scroll to targeted review item when instructed by PreFlight modal or search
+  useEffect(() => {
+    if (!reviewTargetItem || !editorViewRef.current) return;
+    const view = editorViewRef.current;
+    view.dispatch({
+      selection: {
+        anchor: reviewTargetItem.contentFrom || reviewTargetItem.fullFrom,
+        head: reviewTargetItem.contentTo || reviewTargetItem.fullTo,
+      },
+      scrollIntoView: true,
+    });
+    view.focus();
+  }, [reviewTargetItem]);
 
   // Dynamically reconfigure Visual Editor mode without remounting CodeMirror
   useEffect(() => {
@@ -401,10 +538,32 @@ export default function EditorPane({
     const isTexFile = activeFileName.endsWith('.tex');
     view.dispatch({
       effects: visualCompartmentRef.current.reconfigure(
-        editorMode === 'visual' && isTexFile ? visualEditorExtension : []
+        editorMode === 'visual' && isTexFile
+          ? [visualEditorExtension, auxFilesFacet.of(collabSession?.auxFilesMap || null)]
+          : []
       ),
     });
-  }, [editorMode, activeFileName]);
+  }, [editorMode, activeFileName, collabSession]);
+
+  // Refresh visual editor when auxiliary files (figures, bibtex) are updated or imported
+  useEffect(() => {
+    if (!collabSession?.auxFilesMap || !editorViewRef.current) return undefined;
+    const handleAuxChange = () => {
+      const view = editorViewRef.current;
+      if (view && editorMode === 'visual' && activeFileName.endsWith('.tex')) {
+        view.dispatch({
+          effects: visualCompartmentRef.current.reconfigure([
+            visualEditorExtension,
+            auxFilesFacet.of(collabSession.auxFilesMap),
+          ]),
+        });
+      }
+    };
+    collabSession.auxFilesMap.observe(handleAuxChange);
+    return () => {
+      collabSession.auxFilesMap.unobserve(handleAuxChange);
+    };
+  }, [collabSession, editorMode, activeFileName]);
 
   // Dynamically reconfigure Dark / Light theme in CodeMirror without remounting
   useEffect(() => {
@@ -418,6 +577,51 @@ export default function EditorPane({
       ),
     });
   }, [theme]);
+
+  // Open the in-editor Comment Modal with selected manuscript passage
+  const handleOpenAddComment = () => {
+    const view = editorViewRef.current;
+    if (!view) return;
+    const state = view.state;
+    const sel = state.selection.main;
+    let text = '';
+    if (sel.from < sel.to) {
+      text = state.doc.sliceString(sel.from, sel.to);
+    } else {
+      const word = state.wordAt(sel.from);
+      if (word) {
+        text = state.doc.sliceString(word.from, word.to);
+      }
+    }
+    setCommentSelectedText(text.trim());
+    setIsCommentModalOpen(true);
+  };
+
+  const handleCommentModalSubmit = (commentText) => {
+    const view = editorViewRef.current;
+    if (!view || !commentText?.trim()) return;
+    insertCommentInView(view, commentText.trim(), activeUser);
+  };
+
+  // Trigger Add Comment modal from external actions (e.g. Sidebar button)
+  useEffect(() => {
+    if (triggerAddCommentKey > 0) {
+      handleOpenAddComment();
+    }
+  }, [triggerAddCommentKey]);
+
+  const handleJumpToReviewItem = (item) => {
+    const view = editorViewRef.current;
+    if (!view || !item) return;
+    view.dispatch({
+      selection: {
+        anchor: item.contentFrom || item.fullFrom,
+        head: item.contentTo || item.fullTo,
+      },
+      scrollIntoView: true,
+    });
+    view.focus();
+  };
 
   const handleCopyIncludeGraphicsSnippet = async () => {
     const cleanLabel = activeFileName
@@ -656,14 +860,38 @@ export default function EditorPane({
               )}
             </button>
           )}
+
         </div>
       </div>
 
-      {/* CodeMirror 6 Mount Container (Managed strictly via useRef, zero React state) */}
-      <div
-        ref={editorContainerRef}
-        className="flex-1 w-full overflow-hidden relative"
-        data-testid="codemirror-container"
+      {/* CodeMirror 6 Mount Container & Side-by-Side Review Panel */}
+      <div className="flex-1 w-full min-h-0 flex overflow-hidden relative">
+        <div
+          ref={editorContainerRef}
+          className="flex-1 h-full min-w-0 overflow-hidden relative"
+          data-testid="codemirror-container"
+        />
+
+        {isTexFile && isReviewPanelOpen && (
+          <ReviewPanel
+            isOpen={isReviewPanelOpen}
+            onClose={() => setIsReviewPanelOpen(false)}
+            items={reviewItems}
+            editorView={editorViewRef.current}
+            isTrackingChanges={isTrackingChanges}
+            onToggleTrackChanges={() => setIsTrackingChanges((prev) => !prev)}
+            onJumpToItem={handleJumpToReviewItem}
+          />
+        )}
+      </div>
+
+      {/* In-Editor Review Comment Modal */}
+      <CommentModal
+        isOpen={isCommentModalOpen}
+        onClose={() => setIsCommentModalOpen(false)}
+        onSubmit={handleCommentModalSubmit}
+        selectedText={commentSelectedText}
+        user={activeUser}
       />
     </section>
   );

@@ -30,6 +30,9 @@ import {
   Moon,
   Clock,
   Loader2,
+  Sparkles,
+  MessageSquarePlus,
+  MessageSquare,
 } from 'lucide-react';
 import { isImageAssetFile } from '../services/driveService';
 
@@ -64,6 +67,12 @@ export default function Sidebar({
   onOpenGooglePicker,
   theme = 'dark',
   onToggleTheme,
+  isTrackingChanges = false,
+  onToggleTrackChanges,
+  onOpenAddComment,
+  isReviewPanelOpen = false,
+  onToggleReviewPanel,
+  reviewItemsCount = 0,
 }) {
   const [isFilesExpanded, setIsFilesExpanded] = useState(true);
   const [localExpandedFolders, setLocalExpandedFolders] = useState(
@@ -577,7 +586,7 @@ export default function Sidebar({
         )}
       </div>
 
-      {/* Bottom Section: Minimalist Drive Sync Status Card & Theme Switcher */}
+      {/* Bottom Section: Review & Collaboration Controls, Drive Sync Status Card & Theme Switcher */}
       <div className="p-3 border-t border-slate-800/80 bg-slate-950/60 space-y-2.5">
         {driveError && (
           <div className="p-2 rounded-lg bg-rose-950/60 border border-rose-800/70 text-[11px] text-rose-200 flex items-start gap-1.5">
@@ -585,6 +594,115 @@ export default function Sidebar({
             <span className="break-words">{driveError}</span>
           </div>
         )}
+
+        {/* Document Review & Collaboration Controls (Track Changes, Add Comment, Review Panel) */}
+        <div
+          className="bg-slate-900/90 border border-slate-800 rounded-xl p-2.5 space-y-2 text-xs"
+          data-testid="sidebar-review-controls"
+        >
+          <div className="flex items-center justify-between px-0.5 text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
+            <span className="flex items-center gap-1.5">
+              <Sparkles className="w-3 h-3 text-amber-400" />
+              <span>Review Mode</span>
+            </span>
+            {reviewItemsCount > 0 && (
+              <span className="px-1.5 py-0.2 rounded-full text-[10px] font-mono bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+                {reviewItemsCount} {reviewItemsCount === 1 ? 'item' : 'items'}
+              </span>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 gap-1.5">
+            {/* 1. Track Changes (Suggesting Mode) Toggle Button */}
+            <button
+              type="button"
+              onClick={onToggleTrackChanges}
+              className={`w-full py-1.5 px-2.5 rounded-lg flex items-center justify-between text-xs font-medium border transition-all cursor-pointer ${
+                isTrackingChanges
+                  ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 shadow-sm'
+                  : 'bg-slate-800/70 hover:bg-slate-800 text-slate-300 hover:text-white border-slate-700/70'
+              }`}
+              title={
+                isTrackingChanges
+                  ? 'Track Changes is ACTIVE (Suggesting mode: all edits are recorded as suggestions)'
+                  : 'Enable Track Changes (Suggesting mode)'
+              }
+              data-testid="sidebar-track-changes-button"
+            >
+              <span className="flex items-center gap-2">
+                <Sparkles
+                  className={`w-3.5 h-3.5 ${
+                    isTrackingChanges ? 'text-amber-400 animate-pulse' : 'text-slate-400'
+                  }`}
+                />
+                <span>Track Changes</span>
+              </span>
+              <span
+                className={`text-[10px] font-mono uppercase px-1.5 py-0.5 rounded font-semibold ${
+                  isTrackingChanges
+                    ? 'bg-amber-400 text-slate-950 shadow-xs'
+                    : 'bg-slate-800 text-slate-400'
+                }`}
+              >
+                {isTrackingChanges ? 'ON' : 'OFF'}
+              </span>
+            </button>
+
+            {/* 2. Add Comment Button */}
+            {onOpenAddComment && (
+              <button
+                type="button"
+                onClick={onOpenAddComment}
+                className="w-full py-1.5 px-2.5 rounded-lg bg-slate-800/70 hover:bg-slate-800 text-amber-300 hover:text-amber-200 border border-slate-700/70 text-xs font-medium flex items-center justify-between transition-colors cursor-pointer"
+                title="Add a review comment to selected text or current cursor position"
+                data-testid="sidebar-add-comment-button"
+              >
+                <span className="flex items-center gap-2">
+                  <MessageSquarePlus className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Add Comment</span>
+                </span>
+                <span className="text-[10px] text-slate-400 font-mono">Selection</span>
+              </button>
+            )}
+
+            {/* 3. Review & Comments Panel Toggle Button */}
+            {onToggleReviewPanel && (
+              <button
+                type="button"
+                onClick={onToggleReviewPanel}
+                className={`w-full py-1.5 px-2.5 rounded-lg flex items-center justify-between text-xs font-medium border transition-colors cursor-pointer ${
+                  isReviewPanelOpen
+                    ? 'bg-indigo-600 text-white border-indigo-500 shadow-sm'
+                    : 'bg-slate-800/70 hover:bg-slate-800 text-slate-300 hover:text-white border-slate-700/70'
+                }`}
+                title={
+                  isReviewPanelOpen
+                    ? 'Hide Review & Comments panel'
+                    : 'Open Review & Comments panel'
+                }
+                data-testid="sidebar-review-panel-button"
+              >
+                <span className="flex items-center gap-2">
+                  <MessageSquare
+                    className={`w-3.5 h-3.5 ${
+                      isReviewPanelOpen ? 'text-white' : 'text-indigo-400'
+                    }`}
+                  />
+                  <span>Review Panel</span>
+                </span>
+                <span
+                  className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${
+                    isReviewPanelOpen
+                      ? 'bg-indigo-700 text-indigo-100 font-semibold'
+                      : 'bg-slate-800 text-slate-400'
+                  }`}
+                >
+                  {isReviewPanelOpen ? 'Open' : `${reviewItemsCount || 0}`}
+                </span>
+              </button>
+            )}
+          </div>
+        </div>
 
         {/* Minimalist Drive Sync Status Card */}
         <div
