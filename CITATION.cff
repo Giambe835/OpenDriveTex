@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use OpenDriveTeX in your research workflow, please cite it as below."
+type: software
+title: "OpenDriveTeX: A Zero-Backend, P2P Collaborative LaTeX Environment for Google Drive"
+authors:
+  - family-names: "Giambelluca"
+    given-names: "Francisco Luis"
+year: 2026
+license: MIT
+repository-code: "https://github.com/Giambe835/OpenDriveTex"
+keywords:
+  - LaTeX
+  - WebAssembly
+  - BusyTeX
+  - CRDT
+  - Yjs
+  - Google Drive
+  - Collaborative Editing
+  - Scientific Writing
+
