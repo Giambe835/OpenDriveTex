@@ -1,6 +1,7 @@
 # OpenDriveTeX
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24091882.svg)](https://doi.org/10.5281/zenodo.24091882)
 [![Architecture: Zero-Backend](https://img.shields.io/badge/Architecture-Zero--Backend%20P2P-success)](#architecture-overview)
 [![Engine: BusyTeX Wasm](https://img.shields.io/badge/Engine-BusyTeX%20TeX%20Live-orange)](#webassembly-latex-engine--git-lfs-assets)
 [![Google Drive: drive.file](https://img.shields.io/badge/Google%20Drive-drive.file%20Scope-4285F4?logo=googledrive&logoColor=white)](#google-drive-integration--security)
@@ -236,7 +237,9 @@ If you use OpenDriveTeX in your research workflow or academic publications, plea
   title        = {{OpenDriveTeX: A Zero-Backend, P2P Collaborative LaTeX Environment for Google Drive}},
   year         = {2026},
   publisher    = {Zenodo},
-  url          = {https://github.com/Giambe835/OpenDriveTex}
+  version      = {1.0.0},
+  doi          = {10.5281/zenodo.24091882},
+  url          = {https://doi.org/10.5281/zenodo.24091882}
 }
 ```
 
