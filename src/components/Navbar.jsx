@@ -1,7 +1,7 @@
 /**
  * @fileoverview Top Navigation Bar component for OpenDriveTeX.
- * Displays brand identity, clean active project folder name, unified "Open from Drive"
- * control + recent projects dropdown, connected collaborator pills powered by Yjs Awareness,
+ * Displays brand identity, clean active project folder name, "Open from Drive"
+ * button, connected collaborator pills powered by Yjs Awareness,
  * PDF pane visibility toggle, Google Drive manual Save (`Ctrl+S`), and Compile (`Ctrl+Enter`).
  */
 
@@ -42,11 +42,9 @@ export default function Navbar({
   driveFileId = null,
   driveFolderId = null,
   driveFolderName = '',
-  driveFoldersList = [],
   driveSaveStatus = 'idle',
   onManualSaveToDrive,
   onOpenFromDrive,
-  onSelectDriveFolder,
   onExportSubmissionTex,
   onExportSubmissionZip,
   onExportPdf,
@@ -184,44 +182,19 @@ export default function Navbar({
           </div>
         )}
 
-        {/* Unified "Open from Drive" Button + Recent Projects Dropdown */}
-        {isDriveAuthenticated && (
-          <div className="hidden md:flex items-center gap-1.5">
-            {onOpenFromDrive && (
-              <button
-                type="button"
-                onClick={onOpenFromDrive}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-slate-800/90 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors cursor-pointer"
-                title="Open a project folder or .tex file from Google Drive"
-                data-testid="open-from-drive-button"
-              >
-                <FolderSearch className="w-3.5 h-3.5 text-indigo-400" />
-                <span>Open from Drive</span>
-              </button>
-            )}
-
-            {driveFoldersList.length > 0 && onSelectDriveFolder && (
-              <select
-                value={driveFolderId || ''}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  if (val) {
-                    const matched = driveFoldersList.find((f) => f.id === val);
-                    onSelectDriveFolder(val, matched?.name);
-                  }
-                }}
-                className="bg-slate-950/90 text-xs text-slate-300 px-2 py-1.5 rounded-lg border border-slate-800 hover:border-slate-700 focus:border-indigo-500 focus:outline-none cursor-pointer max-w-[160px] truncate"
-                aria-label="Recent Projects"
-                title="Switch to a recent project folder"
-              >
-                <option value="">Recent Projects...</option>
-                {driveFoldersList.map((folder) => (
-                  <option key={folder.id} value={folder.id}>
-                    {folder.name}
-                  </option>
-                ))}
-              </select>
-            )}
+        {/* "Open from Drive" Button */}
+        {isDriveAuthenticated && onOpenFromDrive && (
+          <div className="hidden md:flex items-center">
+            <button
+              type="button"
+              onClick={onOpenFromDrive}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-slate-800/90 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors cursor-pointer"
+              title="Open a project folder or .tex file from Google Drive"
+              data-testid="open-from-drive-button"
+            >
+              <FolderSearch className="w-3.5 h-3.5 text-indigo-400" />
+              <span>Open from Drive</span>
+            </button>
           </div>
         )}
       </div>

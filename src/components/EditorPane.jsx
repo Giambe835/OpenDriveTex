@@ -21,6 +21,7 @@ import {
   crosshairCursor,
 } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
+import { openSearchPanel, search, searchKeymap } from '@codemirror/search';
 import {
   bracketMatching,
   foldGutter,
@@ -208,6 +209,8 @@ export default function EditorPane({
   onToggleTrackChanges: controlledToggleTrackChanges,
   triggerAddCommentKey = 0,
   onReviewItemsChange = null,
+  onFocusChange = null,
+  editorViewExposeRef = null,
 }) {
   const editorContainerRef = useRef(null);
   const editorViewRef = useRef(null);
@@ -421,6 +424,7 @@ export default function EditorPane({
         bracketMatching(),
         syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
         latex(),
+        search({ top: true }),
         themeCompartmentRef.current.of(initialThemeExt),
         visualCompartmentRef.current.of(initialVisualExt),
         trackChangesCompartmentRef.current.of(
@@ -454,8 +458,23 @@ export default function EditorPane({
           },
           ...defaultKeymap,
           ...historyKeymap,
+          ...searchKeymap,
           indentWithTab,
         ]),
+        EditorView.updateListener.of((update) => {
+          if (update.docChanged) {
+            // Guarantee autosave triggers on ANY raw document text mutation
+            // including comments (%), citations, macros, and auxiliary files
+            if (onFocusChange) {
+              onFocusChange('editor');
+            }
+          }
+          if (update.focusChanged && update.view.hasFocus) {
+            if (onFocusChange) {
+              onFocusChange('editor');
+            }
+          }
+        }),
         // Bind the active file's Y.Text and Yjs Awareness directly to CodeMirror 6
         yCollab(targetYText, provider.awareness, { undoManager }),
       ],
@@ -467,6 +486,9 @@ export default function EditorPane({
     });
 
     editorViewRef.current = view;
+    if (editorViewExposeRef) {
+      editorViewExposeRef.current = view;
+    }
 
     // Observe review items in Y.Text in real-time
     const syncReviewItems = () => {
@@ -484,6 +506,9 @@ export default function EditorPane({
       undoManager.destroy();
       view.destroy();
       editorViewRef.current = null;
+      if (editorViewExposeRef) {
+        editorViewExposeRef.current = null;
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [collabSession, activeFileName, isImageView]);

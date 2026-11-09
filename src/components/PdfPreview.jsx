@@ -51,10 +51,13 @@ export default function PdfPreview({
   compileElapsedMs = null,
   engineName = 'Wasm Worker Engine',
   onTriggerCompile,
+  onFocusChange = null,
+  iframeRef: externalIframeRef = null,
 }) {
   const [pdfUrl, setPdfUrl] = useState(null);
   const [isLogDrawerOpen, setIsLogDrawerOpen] = useState(false);
   const [activeLogTab, setActiveLogTab] = useState('all'); // 'all' | 'stdout' | 'stderr'
+  const internalIframeRef = useRef(null);
 
   /**
    * Tracks the active Blob Object URL so it is always revoked via `URL.revokeObjectURL`
@@ -199,10 +202,19 @@ export default function PdfPreview({
 
         {pdfUrl ? (
           <iframe
+            ref={(node) => {
+              internalIframeRef.current = node;
+              if (externalIframeRef) {
+                externalIframeRef.current = node;
+              }
+            }}
             src={pdfUrl}
             title="Compiled LaTeX PDF Preview"
             className="w-full h-full flex-1 border-0 bg-slate-800"
             data-testid="pdf-preview-iframe"
+            onMouseEnter={() => {
+              if (onFocusChange) onFocusChange('pdf');
+            }}
           />
         ) : (
           <div className="flex-1 flex flex-col items-center justify-center p-6 text-center overflow-y-auto">

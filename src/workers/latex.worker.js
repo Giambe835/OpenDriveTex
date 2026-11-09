@@ -12,6 +12,15 @@
 import { BusyTexRunner, PdfLatex } from 'texlyre-busytex';
 
 /**
+ * Active compilation job tracking and serialization queue.
+ * Ensures that overlapping compilation calls never orphan internal timeout timers
+ * or clobber BusyTeX worker message handlers.
+ */
+let activeWorkerTimeout = null;
+let latestJobId = 0;
+let compilationQueue = Promise.resolve();
+
+/**
  * In-memory virtual file system holding project assets (images, bib, cls, sty).
  * @type {Map<string, { path: string, content: string | Uint8Array, mimeType?: string }>}
  */
@@ -359,6 +368,59 @@ async function getOrInitBusyTex() {
       });
 
       await runner.initialize();
+
+      // Intercept compileWithWorker on the runner to guarantee timeouts are reliably tracked and cleared
+      if (typeof runner.compileWithWorker === 'function') {
+        const originalCompileWithWorker = runner.compileWithWorker.bind(runner);
+        runner.compileWithWorker = function wrappedCompileWithWorker(...args) {
+          if (activeWorkerTimeout) {
+            clearTimeout(activeWorkerTimeout);
+            activeWorkerTimeout = null;
+          }
+          return new Promise((resolve, reject) => {
+            if (!this.worker) {
+              reject(new Error('Worker not initialized'));
+              return;
+            }
+            const timeout = setTimeout(() => {
+              activeWorkerTimeout = null;
+              reject(new Error('Compilation timeout'));
+            }, 180000);
+            activeWorkerTimeout = timeout;
+
+            const originalOnMessage = this.worker.onmessage;
+            this.worker.onmessage = (event) => {
+              const data = event.data || {};
+              if (data.pdf !== undefined || data.exception !== undefined) {
+                if (activeWorkerTimeout) {
+                  clearTimeout(activeWorkerTimeout);
+                  activeWorkerTimeout = null;
+                }
+              }
+              if (typeof originalOnMessage === 'function') {
+                originalOnMessage.call(this.worker, event);
+              }
+            };
+
+            originalCompileWithWorker(...args)
+              .then((res) => {
+                if (activeWorkerTimeout) {
+                  clearTimeout(activeWorkerTimeout);
+                  activeWorkerTimeout = null;
+                }
+                resolve(res);
+              })
+              .catch((err) => {
+                if (activeWorkerTimeout) {
+                  clearTimeout(activeWorkerTimeout);
+                  activeWorkerTimeout = null;
+                }
+                reject(err);
+              });
+          });
+        };
+      }
+
       const pdflatex = new PdfLatex(runner);
 
       runnerInstance = runner;
@@ -416,6 +478,7 @@ function parseTexLog(log) {
  * Executes authentic WebAssembly LaTeX compilation.
  */
 async function executeCompilation({ jobId, texSource, mainFile = 'main.tex', auxFiles = [] }) {
+  latestJobId = jobId;
   self.postMessage({ type: 'COMPILE_STARTED', payload: { jobId } });
   const startTime = performance.now();
 
@@ -564,6 +627,12 @@ async function executeCompilation({ jobId, texSource, mainFile = 'main.tex', aux
     const elapsedMs = Math.round(performance.now() - startTime);
     const { errors, warnings } = parseTexLog(logOutput);
 
+    // Clear any pending timeout timer the exact moment result is received
+    if (activeWorkerTimeout) {
+      clearTimeout(activeWorkerTimeout);
+      activeWorkerTimeout = null;
+    }
+
     if (result.success && result.pdf) {
       const pdfBuffer =
         result.pdf instanceof Uint8Array
@@ -636,7 +705,12 @@ self.onmessage = async (event) => {
       break;
 
     case 'COMPILE':
-      await executeCompilation(payload);
+      compilationQueue = compilationQueue
+        .then(() => executeCompilation(payload))
+        .catch((err) => {
+          console.error('[latex.worker] Serialized compilation queue error:', err);
+        });
+      await compilationQueue;
       break;
 
     case 'SYNC_MEMFS':

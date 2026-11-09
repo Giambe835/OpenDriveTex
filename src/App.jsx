@@ -32,6 +32,7 @@ import {
   CheckCircle2,
   FileCode,
 } from 'lucide-react';
+import { openSearchPanel } from '@codemirror/search';
 import Navbar from './components/Navbar';
 import Sidebar from './components/Sidebar';
 import EditorPane from './components/EditorPane';
@@ -394,6 +395,21 @@ export default function App() {
   const latexWorkerRef = useRef(null);
 
   /**
+   * Tracks the active compilation job ID and UI fallback timeout timer
+   * to guarantee that late/orphaned errors never trigger false positive timeout errors.
+   */
+  const activeCompileJobIdRef = useRef(0);
+  const compileTimeoutTimerRef = useRef(null);
+
+  /**
+   * Tracks the last focused/active pane ('editor' | 'pdf') and element references
+   * to provide intelligent context-aware Ctrl+F / Cmd+F search hijacking.
+   */
+  const lastActivePaneRef = useRef('editor');
+  const editorViewInstanceRef = useRef(null);
+  const pdfIframeRef = useRef(null);
+
+  /**
    * Ref to the active collaboration session for stable access inside callbacks.
    * @type {React.MutableRefObject<any>}
    */
@@ -470,8 +486,21 @@ export default function App() {
       const { type, payload = {} } = event.data || {};
 
       if (type === 'COMPILE_STARTED') {
+        if (payload.jobId && payload.jobId >= activeCompileJobIdRef.current) {
+          activeCompileJobIdRef.current = payload.jobId;
+        }
         setCompileStatus('compiling');
       } else if (type === 'COMPILE_SUCCESS') {
+        // Clear any pending compilation timeout immediately upon receiving PDF payload
+        if (compileTimeoutTimerRef.current) {
+          clearTimeout(compileTimeoutTimerRef.current);
+          compileTimeoutTimerRef.current = null;
+        }
+
+        if (payload.jobId && payload.jobId < activeCompileJobIdRef.current) {
+          return;
+        }
+
         setCompileStatus('success');
         if (payload.pdfBuffer) {
           setPdfBuffer(
@@ -490,6 +519,16 @@ export default function App() {
           setEngineName(payload.engine);
         }
       } else if (type === 'COMPILE_ERROR') {
+        if (compileTimeoutTimerRef.current) {
+          clearTimeout(compileTimeoutTimerRef.current);
+          compileTimeoutTimerRef.current = null;
+        }
+
+        // Ignore stale/orphaned error reports from superseded compilation jobs
+        if (payload.jobId && payload.jobId < activeCompileJobIdRef.current) {
+          return;
+        }
+
         setCompileStatus('error');
         setCompileStdout(payload.stdout || '');
         setCompileStderr(payload.stderr || '');
@@ -522,21 +561,35 @@ export default function App() {
     };
   }, []);
 
-  // Ensure authenticated user profile is fetched if token is present on reload
+  // Ensure authenticated user profile and session state are hydrated on initial app load / refresh
   useEffect(() => {
     const token = getValidAccessToken();
-    if (token && !isSimulatedTokenActive() && !getAuthenticatedUserProfile()) {
-      fetchGoogleUserProfile(token)
-        .then((profile) => {
-          setUserProfile(profile);
-          if (collabSessionRef.current) {
-            collabSessionRef.current.updateLocalUserProfile({
-              ...profile,
-              hasDriveToken: true,
-            });
-          }
-        })
-        .catch(() => {});
+    if (token) {
+      setIsDriveAuthenticated(true);
+      const cachedProfile = getAuthenticatedUserProfile();
+      if (cachedProfile) {
+        setUserProfile(cachedProfile);
+        if (collabSessionRef.current) {
+          collabSessionRef.current.updateLocalUserProfile({
+            ...cachedProfile,
+            hasDriveToken: true,
+          });
+        }
+      }
+
+      if (!isSimulatedTokenActive()) {
+        fetchGoogleUserProfile(token)
+          .then((profile) => {
+            setUserProfile(profile);
+            if (collabSessionRef.current) {
+              collabSessionRef.current.updateLocalUserProfile({
+                ...profile,
+                hasDriveToken: true,
+              });
+            }
+          })
+          .catch(() => {});
+      }
     }
   }, []);
 
@@ -586,11 +639,27 @@ export default function App() {
         }
       }
 
+      const jobId = Date.now();
+      activeCompileJobIdRef.current = jobId;
+
+      if (compileTimeoutTimerRef.current) {
+        clearTimeout(compileTimeoutTimerRef.current);
+      }
+      compileTimeoutTimerRef.current = setTimeout(() => {
+        if (activeCompileJobIdRef.current === jobId) {
+          setCompileStatus('error');
+          const timeoutMsg = 'Compilation timeout (180s elapsed).';
+          setCompileStderr(timeoutMsg);
+          setCompileLogs(timeoutMsg);
+          setCompileErrors([{ line: null, message: timeoutMsg, context: '' }]);
+        }
+      }, 180000);
+
       setCompileStatus('compiling');
       worker.postMessage({
         type: 'COMPILE',
         payload: {
-          jobId: Date.now(),
+          jobId,
           texSource,
           mainFile: driveFileName || 'main.tex',
           auxFiles: memfsAuxFiles,
@@ -744,12 +813,28 @@ export default function App() {
         setSharedFolderNeedsFilePicker(false);
         if (!hasTriggeredInitialCompile && latexWorkerRef.current) {
           hasTriggeredInitialCompile = true;
+          const jobId = Date.now();
+          activeCompileJobIdRef.current = jobId;
+
+          if (compileTimeoutTimerRef.current) {
+            clearTimeout(compileTimeoutTimerRef.current);
+          }
+          compileTimeoutTimerRef.current = setTimeout(() => {
+            if (activeCompileJobIdRef.current === jobId) {
+              setCompileStatus('error');
+              const timeoutMsg = 'Compilation timeout (180s elapsed).';
+              setCompileStderr(timeoutMsg);
+              setCompileLogs(timeoutMsg);
+              setCompileErrors([{ line: null, message: timeoutMsg, context: '' }]);
+            }
+          }, 180000);
+
           setCompileStatus('compiling');
           const memfsFiles = prepareMemfsAuxFiles(session, driveFolderFilesRef.current || []);
           latexWorkerRef.current.postMessage({
             type: 'COMPILE',
             payload: {
-              jobId: Date.now(),
+              jobId,
               texSource: session.ytext.toString(),
               mainFile: session.projectMeta?.get('mainTexFileName') || 'main.tex',
               auxFiles: memfsFiles,
@@ -861,9 +946,9 @@ export default function App() {
       } else if (getValidAccessToken() && reconcileSessionWithDriveFolderRef.current) {
         // Page reload with an existing `#room=<folderId>` hash:
         // Always query Google Drive (`files.list` with `trashed=false` and `Cache-Control: no-cache`)
-        // to reconcile stale IndexedDB cache with the live Google Drive folder state.
+        // to fetch the absolute latest file state directly from Google Drive API (Drive-first, no stale local cache)
         await reconcileSessionWithDriveFolderRef.current(session, roomName, null, {
-          forceOverwriteText: false,
+          forceOverwriteText: true,
         });
       }
 
@@ -1128,7 +1213,7 @@ export default function App() {
               collabSessionRef.current,
               cleanFolderId,
               folderFiles,
-              { forceOverwriteText: false }
+              { forceOverwriteText: true }
             );
           } else {
             pendingRoomHydrationRef.current = {
@@ -1141,7 +1226,7 @@ export default function App() {
               auxFiles: auxItems,
               folderFiles,
               canWriteDriveFile: true,
-              forceOverwrite: false,
+              forceOverwrite: true,
             };
             setRoomInUrlHash(targetRoomId);
           }
@@ -1165,7 +1250,7 @@ export default function App() {
               collabSessionRef.current,
               cleanFolderId,
               folderFiles,
-              { forceOverwriteText: false }
+              { forceOverwriteText: true }
             );
             if (collabSessionRef.current.ytext.length > 0) {
               setSharedFolderNeedsFilePicker(false);
@@ -2494,9 +2579,36 @@ export default function App() {
     window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
   }, [pdfBuffer, driveFileName]);
 
-  // Global keyboard shortcuts for `Ctrl+Enter` (Compile) and `Ctrl+S` (Manual Save to Drive via Leader)
+  // Global keyboard shortcuts for `Ctrl+Enter` (Compile), `Ctrl+S` (Save), and `Ctrl+F` (Context-Aware Search)
   useEffect(() => {
     const handleGlobalKeyDown = (e) => {
+      // Context-aware search (Ctrl+F / Cmd+F)
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'f' || e.key === 'F')) {
+        e.preventDefault();
+
+        const activeElement = document.activeElement;
+        const isEditorFocused =
+          lastActivePaneRef.current === 'editor' ||
+          (activeElement && activeElement.closest('.cm-editor'));
+
+        if (isEditorFocused && editorViewInstanceRef.current) {
+          const view = editorViewInstanceRef.current;
+          view.focus();
+          openSearchPanel(view);
+        } else if (pdfIframeRef.current) {
+          // Focus the PDF preview iframe or trigger its search
+          try {
+            pdfIframeRef.current.focus();
+            if (pdfIframeRef.current.contentWindow) {
+              pdfIframeRef.current.contentWindow.focus();
+            }
+          } catch {
+            // Ignore cross-origin issues
+          }
+        }
+        return;
+      }
+
       if (!collabSessionRef.current) return;
       if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
         e.preventDefault();
@@ -2512,9 +2624,9 @@ export default function App() {
       }
     };
 
-    window.addEventListener('keydown', handleGlobalKeyDown);
+    window.addEventListener('keydown', handleGlobalKeyDown, { capture: true });
     return () => {
-      window.removeEventListener('keydown', handleGlobalKeyDown);
+      window.removeEventListener('keydown', handleGlobalKeyDown, { capture: true });
     };
   }, [handleCompile, handleManualSaveToDrive, handleExportTex]);
 
@@ -2623,11 +2735,9 @@ export default function App() {
         driveFileId={driveFileId}
         driveFolderId={driveFolderId}
         driveFolderName={driveFolderName}
-        driveFoldersList={driveFoldersList}
         driveSaveStatus={driveSaveStatus}
         onManualSaveToDrive={handleManualSaveToDrive}
         onOpenFromDrive={() => handleOpenGooglePicker('folder')}
-        onSelectDriveFolder={handleSelectDriveFolder}
         onExportSubmissionTex={handleExportSubmissionTex}
         onExportSubmissionZip={handleExportSubmissionZip}
         onExportPdf={handleExportPdf}
@@ -2738,6 +2848,10 @@ export default function App() {
                   onToggleTrackChanges={handleToggleTrackChanges}
                   triggerAddCommentKey={triggerAddCommentKey}
                   onReviewItemsChange={setReviewItems}
+                  onFocusChange={(pane) => {
+                    lastActivePaneRef.current = pane;
+                  }}
+                  editorViewExposeRef={editorViewInstanceRef}
                 />
               </div>
 
@@ -2781,6 +2895,10 @@ export default function App() {
                     compileElapsedMs={compileElapsedMs}
                     engineName={engineName}
                     onTriggerCompile={handleCompile}
+                    onFocusChange={(pane) => {
+                      lastActivePaneRef.current = pane;
+                    }}
+                    iframeRef={pdfIframeRef}
                   />
                 </div>
               )}
@@ -2952,35 +3070,6 @@ export default function App() {
                       </button>
                     </form>
                   </div>
-
-                  {/* Recently Authorized Project Folders List */}
-                  {driveFoldersList.length > 0 && (
-                    <div className="space-y-2 pt-2 border-t border-slate-800/80">
-                      <div className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-                        Recently Authorized Project Folders
-                      </div>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-40 overflow-y-auto pr-1">
-                        {driveFoldersList.map((folder) => (
-                          <button
-                            key={folder.id}
-                            type="button"
-                            onClick={() => handleSelectDriveFolder(folder.id, folder.name)}
-                            className="flex items-center justify-between p-2.5 rounded-lg bg-slate-950/70 hover:bg-slate-800/90 border border-slate-800 text-left transition-colors cursor-pointer"
-                          >
-                            <span className="flex items-center gap-2 min-w-0">
-                              <FolderOpen className="w-4 h-4 text-indigo-400 shrink-0" />
-                              <span className="text-xs font-medium text-slate-200 truncate">
-                                {folder.name}
-                              </span>
-                            </span>
-                            <span className="text-[10px] font-mono text-indigo-400 shrink-0 ml-2">
-                              Open →
-                            </span>
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
                 </div>
               )}
 

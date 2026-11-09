@@ -758,6 +758,10 @@ export function createCollabSession(options = {}) {
         return;
       }
 
+      triggerAutoSaveTimer();
+    };
+
+    const triggerAutoSaveTimer = () => {
       if (!isDriveFileLinked || !isDriveFileLinked()) {
         return;
       }
@@ -783,11 +787,20 @@ export function createCollabSession(options = {}) {
       }, debounceMs);
     };
 
+    const handleYDocUpdate = (_update, origin) => {
+      if (origin === 'initial-boilerplate' || origin === 'drive-load' || origin === 'folder-reconcile-prune') {
+        return;
+      }
+      triggerAutoSaveTimer();
+    };
+
     ytext.observe(handleYTextChange);
+    ydoc.on('update', handleYDocUpdate);
 
     return () => {
       clearPendingTimer();
       ytext.unobserve(handleYTextChange);
+      ydoc.off('update', handleYDocUpdate);
     };
   };
 

@@ -51,7 +51,9 @@ const DRIVE_API_BASE_URL = 'https://www.googleapis.com/drive/v3/files';
 const DRIVE_UPLOAD_BASE_URL = 'https://www.googleapis.com/upload/drive/v3/files';
 
 /**
- * Session storage keys for persisting active OAuth access token and user profile within a tab.
+ * Session and Local storage keys for persisting active OAuth access token and user profile.
+ * Storing in both localStorage and sessionStorage guarantees session persistence across hard page reloads
+ * and preserves pending offline edits while adhering to standard web security practices.
  */
 const TOKEN_STORAGE_KEY = 'opendrivetex_gis_token_v2';
 const USER_PROFILE_STORAGE_KEY = 'opendrivetex_google_user_profile_v1';
@@ -478,23 +480,34 @@ export function loadGooglePickerApi() {
 
 /**
  * Returns the currently valid OAuth 2.0 access token, or `null` if unauthenticated or expired.
+ * Checks memory, sessionStorage, and localStorage.
  *
  * @returns {string | null}
  */
 export function getValidAccessToken() {
   if (!currentTokenRecord) {
     try {
-      const raw = sessionStorage.getItem(TOKEN_STORAGE_KEY);
+      let raw = sessionStorage.getItem(TOKEN_STORAGE_KEY);
+      if (!raw) {
+        raw = localStorage.getItem(TOKEN_STORAGE_KEY);
+      }
       if (raw) {
         const parsed = JSON.parse(raw);
         if (parsed && parsed.accessToken && parsed.expiresAt > Date.now()) {
           currentTokenRecord = parsed;
+          // Synchronize back to sessionStorage if read from localStorage
+          try {
+            sessionStorage.setItem(TOKEN_STORAGE_KEY, raw);
+          } catch {
+            // Ignore
+          }
         } else {
           sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+          localStorage.removeItem(TOKEN_STORAGE_KEY);
         }
       }
     } catch {
-      // Ignore sessionStorage errors
+      // Ignore storage errors
     }
   }
 
@@ -594,6 +607,7 @@ export async function refreshAccessToken() {
               currentTokenRecord = record;
               try {
                 sessionStorage.setItem(TOKEN_STORAGE_KEY, JSON.stringify(record));
+                localStorage.setItem(TOKEN_STORAGE_KEY, JSON.stringify(record));
               } catch {
                 // Ignore storage errors
               }
@@ -644,7 +658,12 @@ export async function ensureValidAccessToken() {
   }
 
   // If a session or profile exists, attempt silent refresh
-  const stored = sessionStorage.getItem(TOKEN_STORAGE_KEY);
+  let stored = null;
+  try {
+    stored = sessionStorage.getItem(TOKEN_STORAGE_KEY) || localStorage.getItem(TOKEN_STORAGE_KEY);
+  } catch {
+    // Ignore storage read errors
+  }
   const profile = getAuthenticatedUserProfile();
   if (stored || profile || currentTokenRecord) {
     try {
@@ -660,6 +679,7 @@ export async function ensureValidAccessToken() {
 
 /**
  * Returns the cached authenticated Google user profile (`{ name, email, picture }`) if available.
+ * Checks memory, sessionStorage, and localStorage.
  *
  * @returns {{ name: string, email: string, picture: string, sub?: string } | null}
  */
@@ -668,11 +688,19 @@ export function getAuthenticatedUserProfile() {
     return currentUserProfile;
   }
   try {
-    const raw = sessionStorage.getItem(USER_PROFILE_STORAGE_KEY);
+    let raw = sessionStorage.getItem(USER_PROFILE_STORAGE_KEY);
+    if (!raw) {
+      raw = localStorage.getItem(USER_PROFILE_STORAGE_KEY);
+    }
     if (raw) {
       const parsed = JSON.parse(raw);
       if (parsed && parsed.name) {
         currentUserProfile = parsed;
+        try {
+          sessionStorage.setItem(USER_PROFILE_STORAGE_KEY, raw);
+        } catch {
+          // Ignore
+        }
         return currentUserProfile;
       }
     }
@@ -712,6 +740,7 @@ export async function fetchGoogleUserProfile(accessToken) {
   currentUserProfile = profile;
   try {
     sessionStorage.setItem(USER_PROFILE_STORAGE_KEY, JSON.stringify(profile));
+    localStorage.setItem(USER_PROFILE_STORAGE_KEY, JSON.stringify(profile));
   } catch {
     // Ignore storage errors
   }
@@ -822,6 +851,8 @@ export function signOutGoogleDrive() {
   try {
     sessionStorage.removeItem(TOKEN_STORAGE_KEY);
     sessionStorage.removeItem(USER_PROFILE_STORAGE_KEY);
+    localStorage.removeItem(TOKEN_STORAGE_KEY);
+    localStorage.removeItem(USER_PROFILE_STORAGE_KEY);
   } catch {
     // Ignore storage errors
   }
@@ -892,6 +923,7 @@ export async function authenticateWithGoogleDrive(options = {}) {
           currentTokenRecord = record;
           try {
             sessionStorage.setItem(TOKEN_STORAGE_KEY, JSON.stringify(record));
+            localStorage.setItem(TOKEN_STORAGE_KEY, JSON.stringify(record));
           } catch {
             // Ignore storage errors
           }
