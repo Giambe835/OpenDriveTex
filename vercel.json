@@ -1,0 +1,38 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "cleanUrls": true,
+  "rewrites": [
+    {
+      "source": "/core/busytex/:file((?:biber|texlive-basic|texlive-recommended|texlive-extra)\\.data)",
+      "destination": "https://github.com/Giambe835/OpenDriveTex/releases/download/v1.0.0/:file"
+    },
+    {
+      "source": "/:file((?:biber|texlive-basic|texlive-recommended|texlive-extra)\\.data)",
+      "destination": "https://github.com/Giambe835/OpenDriveTex/releases/download/v1.0.0/:file"
+    },
+    {
+      "source": "/((?!assets/|core/|favicon|.*\\..*).*)$",
+      "destination": "/index.html"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/core/busytex/(.*)",
+      "headers": [
+        {
+          "key": "Cross-Origin-Opener-Policy",
+          "value": "same-origin"
+        },
+        {
+          "key": "Cross-Origin-Embedder-Policy",
+          "value": "require-corp"
+        },
+        {
+          "key": "Access-Control-Allow-Origin",
+          "value": "*"
+        }
+      ]
+    }
+  ]
+}
+

@@ -8,6 +8,7 @@
     "dev": "vite",
     "prebuild": "node scripts/fetch-busytex-assets.mjs",
     "build": "vite build",
+    "build:vercel": "node scripts/build-vercel-output.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
