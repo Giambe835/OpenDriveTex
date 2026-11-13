@@ -244,6 +244,18 @@ export default function EditorPane({
     [userProfile?.name, userProfile?.email, userProfile?.picture, collabSession]
   );
 
+  // Ensure Yjs Awareness always has the latest user name and cursor color
+  useEffect(() => {
+    if (!collabSession?.updateLocalUserProfile) return;
+    if (userProfile?.name) {
+      collabSession.updateLocalUserProfile({
+        name: userProfile.name,
+        email: userProfile.email || '',
+        picture: userProfile.picture || '',
+      });
+    }
+  }, [collabSession, userProfile?.name, userProfile?.email, userProfile?.picture]);
+
   // Track Changes (Suggesting Mode) state
   const [internalTrackingChanges, setInternalTrackingChanges] = useState(() => {
     try {
@@ -393,8 +405,13 @@ export default function EditorPane({
       return undefined;
     }
 
-    const { ytext, getYTextForFile, provider } = collabSession;
-    const targetYText = getYTextForFile ? getYTextForFile(activeFileName) : ytext;
+    const { ytext, getOrCreateFileText, getYTextForFile, awareness, provider } = collabSession;
+    const targetYText = getOrCreateFileText
+      ? getOrCreateFileText(activeFileName)
+      : getYTextForFile
+      ? getYTextForFile(activeFileName)
+      : ytext;
+    const activeAwareness = awareness || provider?.awareness;
 
     // Scoped Yjs UndoManager so each collaborator only undoes their own transactions
     const undoManager = new Y.UndoManager(targetYText);
@@ -476,7 +493,7 @@ export default function EditorPane({
           }
         }),
         // Bind the active file's Y.Text and Yjs Awareness directly to CodeMirror 6
-        yCollab(targetYText, provider.awareness, { undoManager }),
+        yCollab(targetYText, activeAwareness, { undoManager }),
       ],
     });
 
@@ -490,8 +507,8 @@ export default function EditorPane({
       editorViewExposeRef.current = view;
     }
 
-    // Observe review items in Y.Text in real-time
-    const syncReviewItems = () => {
+    // Observe review items in Y.Text in real-time (including remote-ws updates)
+    const syncReviewItems = (_event) => {
       const items = isTexFile ? scanReviewItems(targetYText.toString()) : [];
       setReviewItems(items);
       if (onReviewItemsChange) {

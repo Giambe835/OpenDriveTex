@@ -67,6 +67,18 @@ const API_KEY_STORAGE_KEY = 'opendrivetex_google_api_key';
 let currentTokenRecord = null;
 
 /**
+ * Exact epoch timestamp (ms) when the current Google OAuth access token expires.
+ * @type {number}
+ */
+let tokenExpiresAt = 0;
+
+/**
+ * Timestamp (ms) of the last proactive token refresh attempt on user activity (60s throttle).
+ * @type {number}
+ */
+let lastProactiveRefreshAttemptAt = 0;
+
+/**
  * In-memory authenticated Google user profile (`{ name, email, picture, sub }`).
  * @type {{ name: string, email: string, picture: string, sub?: string } | null}
  */
@@ -495,6 +507,7 @@ export function getValidAccessToken() {
         const parsed = JSON.parse(raw);
         if (parsed && parsed.accessToken && parsed.expiresAt > Date.now()) {
           currentTokenRecord = parsed;
+          tokenExpiresAt = parsed.expiresAt;
           // Synchronize back to sessionStorage if read from localStorage
           try {
             sessionStorage.setItem(TOKEN_STORAGE_KEY, raw);
@@ -502,6 +515,9 @@ export function getValidAccessToken() {
             // Ignore
           }
         } else {
+          if (parsed && parsed.expiresAt) {
+            tokenExpiresAt = parsed.expiresAt;
+          }
           sessionStorage.removeItem(TOKEN_STORAGE_KEY);
           localStorage.removeItem(TOKEN_STORAGE_KEY);
         }
@@ -512,6 +528,7 @@ export function getValidAccessToken() {
   }
 
   if (currentTokenRecord && currentTokenRecord.expiresAt > Date.now()) {
+    tokenExpiresAt = currentTokenRecord.expiresAt;
     return currentTokenRecord.accessToken;
   }
 
@@ -526,155 +543,166 @@ export function getValidAccessToken() {
 let activeTokenRefreshPromise = null;
 
 /**
- * Automatically requests a fresh Google OAuth 2.0 access token via Google Identity Services (GIS)
- * using `tokenClient.requestAccessToken({ prompt: '', login_hint: userEmail })`.
+ * Requests a fresh Google OAuth 2.0 access token via Google Identity Services (GIS)
+ * calling `tokenClient.requestAccessToken({ prompt: '' })` synchronously inside a
+ * user gesture handler so the browser does not block the popup.
  *
- * Stores `expiresAt = Date.now() + (tokenResponse.expires_in - 120) * 1000` to prevent
- * 60-minute HTTP 401 expiration during long writing sessions.
- *
- * @returns {Promise<string | null>} Fresh access token.
+ * @returns {Promise<string>} Fresh access token.
  */
-export async function refreshAccessToken() {
+export function refreshTokenFromUserGesture() {
   if (isSimulatedTokenActive()) {
     if (currentTokenRecord) {
-      currentTokenRecord.expiresAt = Date.now() + 3600 * 1000;
+      tokenExpiresAt = Date.now() + 3600 * 1000;
+      currentTokenRecord.expiresAt = tokenExpiresAt;
       try {
         sessionStorage.setItem(TOKEN_STORAGE_KEY, JSON.stringify(currentTokenRecord));
       } catch {
         // Ignore storage write errors
       }
-      return currentTokenRecord.accessToken;
+      return Promise.resolve(currentTokenRecord.accessToken);
     }
-    return null;
+    return Promise.reject(new Error('No active simulated token.'));
   }
 
   if (activeTokenRefreshPromise) {
     return activeTokenRefreshPromise;
   }
 
-  activeTokenRefreshPromise = (async () => {
-    try {
-      const resolvedClientId = getConfiguredGoogleClientId();
-      if (!resolvedClientId) {
-        throw new Error('Missing Google OAuth Client ID for token refresh.');
+  const resolvedClientId = getConfiguredGoogleClientId();
+  if (!resolvedClientId) {
+    return Promise.reject(new Error('Missing Google OAuth Client ID for token refresh.'));
+  }
+
+  const userEmail = currentUserProfile?.email || getAuthenticatedUserProfile()?.email || '';
+
+  const startSyncRequest = () =>
+    new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          reject(new Error('Google OAuth token refresh timed out.'));
+        }
+      }, 30000);
+
+      try {
+        const client = window.google.accounts.oauth2.initTokenClient({
+          client_id: resolvedClientId,
+          scope: GOOGLE_OAUTH_SCOPES,
+          callback: (tokenResponse) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+
+            if (tokenResponse.error) {
+              reject(
+                new Error(
+                  tokenResponse.error_description ||
+                    `Google OAuth Token Refresh Error: ${tokenResponse.error}`
+                )
+              );
+              return;
+            }
+
+            const expiresInSec = Number(tokenResponse.expires_in) || 3599;
+            tokenExpiresAt = Date.now() + expiresInSec * 1000;
+            const record = {
+              accessToken: tokenResponse.access_token,
+              expiresAt: tokenExpiresAt,
+              isSimulated: false,
+            };
+
+            currentTokenRecord = record;
+            try {
+              sessionStorage.setItem(TOKEN_STORAGE_KEY, JSON.stringify(record));
+              localStorage.setItem(TOKEN_STORAGE_KEY, JSON.stringify(record));
+            } catch {
+              // Ignore storage errors
+            }
+
+            resolve(tokenResponse.access_token);
+          },
+          error_callback: (err) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            reject(new Error(err?.message || 'Google OAuth token refresh failed.'));
+          },
+        });
+
+        client.requestAccessToken({
+          prompt: '',
+          login_hint: userEmail || undefined,
+        });
+      } catch (err) {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          reject(err);
+        }
       }
+    });
 
-      await loadGisClientScript();
+  if (window.google?.accounts?.oauth2?.initTokenClient) {
+    activeTokenRefreshPromise = startSyncRequest().finally(() => {
+      activeTokenRefreshPromise = null;
+    });
+    return activeTokenRefreshPromise;
+  }
 
+  activeTokenRefreshPromise = loadGisClientScript()
+    .then(() => {
       if (!window.google?.accounts?.oauth2?.initTokenClient) {
         throw new Error(
           'Google Identity Services (google.accounts.oauth2.initTokenClient) is unavailable.'
         );
       }
-
-      const userEmail = currentUserProfile?.email || getAuthenticatedUserProfile()?.email || '';
-
-      const refreshedToken = await new Promise((resolve, reject) => {
-        let settled = false;
-        const timer = setTimeout(() => {
-          if (!settled) {
-            settled = true;
-            reject(new Error('Silent Google OAuth token refresh timed out.'));
-          }
-        }, 15000);
-
-        try {
-          const client = window.google.accounts.oauth2.initTokenClient({
-            client_id: resolvedClientId,
-            scope: GOOGLE_OAUTH_SCOPES,
-            callback: (tokenResponse) => {
-              if (settled) return;
-              settled = true;
-              clearTimeout(timer);
-
-              if (tokenResponse.error) {
-                reject(
-                  new Error(
-                    tokenResponse.error_description ||
-                      `Google OAuth Token Refresh Error: ${tokenResponse.error}`
-                  )
-                );
-                return;
-              }
-
-              const expiresInSec = Number(tokenResponse.expires_in) || 3599;
-              const record = {
-                accessToken: tokenResponse.access_token,
-                expiresAt: Date.now() + (expiresInSec - 120) * 1000,
-                isSimulated: false,
-              };
-
-              currentTokenRecord = record;
-              try {
-                sessionStorage.setItem(TOKEN_STORAGE_KEY, JSON.stringify(record));
-                localStorage.setItem(TOKEN_STORAGE_KEY, JSON.stringify(record));
-              } catch {
-                // Ignore storage errors
-              }
-
-              resolve(tokenResponse.access_token);
-            },
-            error_callback: (err) => {
-              if (settled) return;
-              settled = true;
-              clearTimeout(timer);
-              reject(new Error(err?.message || 'Silent token refresh failed.'));
-            },
-          });
-
-          client.requestAccessToken({
-            prompt: '',
-            login_hint: userEmail || undefined,
-          });
-        } catch (err) {
-          if (!settled) {
-            settled = true;
-            clearTimeout(timer);
-            reject(err);
-          }
-        }
-      });
-
-      return refreshedToken;
-    } finally {
+      return startSyncRequest();
+    })
+    .finally(() => {
       activeTokenRefreshPromise = null;
-    }
-  })();
+    });
 
   return activeTokenRefreshPromise;
 }
 
 /**
- * Ensures that a valid (unexpired) access token is available.
- * If the current token is missing or within 120s of expiring, automatically triggers
- * a silent token refresh via GIS before returning.
+ * Throttled proactive token refresh invoked ONLY from real user activity handlers
+ * (pointerdown, manual save, compile click). Refreshes the token if fewer than
+ * 10 minutes (600,000 ms) remain before expiration.
+ */
+export function tryProactiveRefreshOnUserActivity() {
+  if (isSimulatedTokenActive()) return;
+  const activeToken = getValidAccessToken();
+  if (!activeToken || !tokenExpiresAt) return;
+
+  const now = Date.now();
+  if (now > tokenExpiresAt - 600000 && now < tokenExpiresAt) {
+    if (now - lastProactiveRefreshAttemptAt < 60000) {
+      return;
+    }
+    lastProactiveRefreshAttemptAt = now;
+    refreshTokenFromUserGesture().catch((err) => {
+      console.warn('[OpenDriveTeX] Proactive token refresh on user activity failed:', err);
+    });
+  }
+}
+
+/**
+ * Legacy wrapper kept for API compatibility.
+ * @returns {Promise<string | null>} Fresh access token.
+ */
+export async function refreshAccessToken() {
+  return refreshTokenFromUserGesture();
+}
+
+/**
+ * Returns the currently valid (unexpired) access token without triggering background popups.
  *
  * @returns {Promise<string | null>}
  */
 export async function ensureValidAccessToken() {
-  const currentToken = getValidAccessToken();
-  if (currentToken) {
-    return currentToken;
-  }
-
-  // If a session or profile exists, attempt silent refresh
-  let stored = null;
-  try {
-    stored = sessionStorage.getItem(TOKEN_STORAGE_KEY) || localStorage.getItem(TOKEN_STORAGE_KEY);
-  } catch {
-    // Ignore storage read errors
-  }
-  const profile = getAuthenticatedUserProfile();
-  if (stored || profile || currentTokenRecord) {
-    try {
-      const refreshed = await refreshAccessToken();
-      if (refreshed) return refreshed;
-    } catch (err) {
-      console.warn('[OpenDriveTeX] Silent token refresh attempt failed:', err);
-    }
-  }
-
-  return null;
+  return getValidAccessToken();
 }
 
 /**
@@ -914,9 +942,10 @@ export async function authenticateWithGoogleDrive(options = {}) {
           }
 
           const expiresInSec = Number(tokenResponse.expires_in) || 3599;
+          tokenExpiresAt = Date.now() + expiresInSec * 1000;
           const record = {
             accessToken: tokenResponse.access_token,
-            expiresAt: Date.now() + (expiresInSec - 120) * 1000,
+            expiresAt: tokenExpiresAt,
             isSimulated: false,
           };
 
@@ -982,7 +1011,20 @@ export async function authenticateWithGoogleDrive(options = {}) {
  */
 export async function openGoogleDrivePicker(options = {}) {
   const { mode = 'folder', parentFolderId } = options;
-  const token = (await ensureValidAccessToken()) || getValidAccessToken();
+  // Always ensure token is fresh before initializing Google Picker to prevent HTTP 401 iframe errors
+  const freshToken = (await ensureValidAccessToken()) || (await refreshAccessToken());
+  let token = freshToken;
+  if (!token) {
+    token = getValidAccessToken();
+  }
+  if (!token) {
+    try {
+      const auth = await authenticateWithGoogleDrive({ prompt: '' });
+      token = auth?.accessToken;
+    } catch {
+      // Ignore
+    }
+  }
   if (!token) {
     throw new Error('Please sign in with Google first before opening the Google Drive Picker.');
   }
@@ -1234,9 +1276,16 @@ export function isValidPngHeader(bytes) {
 async function getAuthContext(explicitToken) {
   let token = explicitToken;
   if (!token) {
-    token = (await ensureValidAccessToken()) || getValidAccessToken();
+    token = getValidAccessToken();
   }
-  if (!token) {
+
+  if (!token || (tokenExpiresAt > 0 && Date.now() >= tokenExpiresAt)) {
+    const hadSession = Boolean(tokenExpiresAt > 0 || getAuthenticatedUserProfile());
+    currentTokenRecord = null;
+    if (hadSession && typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('opendrivetex:session-expired'));
+      throw new Error('SESSION_EXPIRED');
+    }
     throw new Error('Not authenticated with Google Drive. Please connect your Google account first.');
   }
 
@@ -1252,7 +1301,13 @@ async function getAuthContext(explicitToken) {
 }
 
 /**
- * Executes a fetch request against the Google Drive API with automatic 401 token refresh retry.
+ * Default timeout for Google Drive API fetch requests (15 seconds).
+ */
+const DRIVE_FETCH_TIMEOUT_MS = 15000;
+
+/**
+ * Executes a fetch request against the Google Drive API with automatic 401 token refresh retry
+ * and an AbortController timeout of 15 seconds to prevent hanging promises.
  *
  * @param {string} url
  * @param {RequestInit} [options={}]
@@ -1272,26 +1327,46 @@ async function driveFetchWithRetry(url, options = {}, explicitToken) {
     Authorization: `Bearer ${auth.token}`,
   };
 
-  let response = await fetch(url, {
-    ...options,
-    headers: mergedHeaders,
-  });
+  const executeFetchWithTimeout = async (headers, timeoutMs = DRIVE_FETCH_TIMEOUT_MS) => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      controller.abort(new Error(`Google Drive API request timed out after ${timeoutMs}ms.`));
+    }, timeoutMs);
 
-  // If any Drive API call returns HTTP 401, automatically request a fresh token via GIS
-  // and retry the failed request seamlessly.
-  if (response.status === 401) {
     try {
-      const freshToken = await refreshAccessToken();
-      if (freshToken) {
-        mergedHeaders.Authorization = `Bearer ${freshToken}`;
-        response = await fetch(url, {
-          ...options,
-          headers: mergedHeaders,
-        });
-      }
-    } catch (refreshErr) {
-      console.warn('[OpenDriveTeX] Auto-retry on HTTP 401 failed:', refreshErr);
+      return await fetch(url, {
+        ...options,
+        headers,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeoutId);
     }
+  };
+
+  let response;
+  try {
+    response = await executeFetchWithTimeout(mergedHeaders);
+  } catch (fetchErr) {
+    // If the error was an abort or network error, let caller handle or inspect
+    throw fetchErr;
+  }
+
+  // If any Drive API call returns HTTP 401, do NOT call requestAccessToken in background.
+  // Notify the app that the session expired and abort the background call cleanly.
+  if (response.status === 401) {
+    currentTokenRecord = null;
+    tokenExpiresAt = 0;
+    try {
+      sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+      localStorage.removeItem(TOKEN_STORAGE_KEY);
+    } catch {
+      // Ignore storage errors
+    }
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('opendrivetex:session-expired'));
+    }
+    throw new Error('SESSION_EXPIRED');
   }
 
   return response;
@@ -1567,7 +1642,7 @@ export async function updateDriveFileContent(fileId, texContent, accessToken) {
     const errText = await response.text().catch(() => '');
     const error = new Error(
       response.status === 404
-        ? 'Please click main.tex in the Google Picker once to grant save permission to your account.'
+        ? 'Please select main.tex in the Google Drive window to grant edit access to this document.'
         : `Google Drive PATCH failed (${response.status}): ${errText || response.statusText}`
     );
     error.status = response.status;
@@ -1926,51 +2001,172 @@ export async function createDriveSubfolder(folderName = 'subfolder', parentFolde
   return response.json();
 }
 
+const folderIdCache = new Map();
+const pendingFolderPromises = new Map();
+
+/**
+ * Resolves an existing Google Drive subfolder ID or creates it only as a last resort,
+ * following a strict 4-step pipeline (Memory Cache -> Sibling File Inference ->
+ * Explicit Drive Query -> Locked Creation) to prevent duplicate folders and race conditions.
+ *
+ * @param {string} projectRootId - Top-level Google Drive project folder ID.
+ * @param {string} folderPath - Relative subfolder path (e.g. `'output_figures'`).
+ * @param {Array<any>} [projectFiles=[]] - Already-loaded project files with `path`/`parents`/`parentId`.
+ * @param {string} [accessToken] - OAuth 2.0 Bearer token.
+ * @returns {Promise<string>} The resolved Google Drive folder ID.
+ */
+export async function resolveOrCreateSubfolderId(
+  projectRootId,
+  folderPath,
+  projectFiles = [],
+  accessToken,
+  forceCreate = false
+) {
+  if (!isValidDriveId(projectRootId)) {
+    return projectRootId;
+  }
+  const { token: resolvedToken, isSimulated } = await getAuthContext(accessToken);
+  const effectiveToken = accessToken || resolvedToken;
+  const rootId = projectRootId.trim();
+  const cleanPath = (folderPath || '').replace(/^\.+\/|\/+$/g, '').replace(/^\/+/, '').trim();
+  if (!cleanPath) {
+    return rootId;
+  }
+
+  const parts = cleanPath.split('/').filter(Boolean);
+  let currentParentId = rootId;
+  let accumulatedPath = '';
+
+  for (let idx = 0; idx < parts.length; idx++) {
+    const cleanPart = parts[idx].trim();
+    if (!cleanPart) continue;
+
+    accumulatedPath = accumulatedPath ? `${accumulatedPath}/${cleanPart}` : cleanPart;
+    const cacheKey = `${rootId}/${accumulatedPath}`;
+
+    if (forceCreate && idx === parts.length - 1) {
+      folderIdCache.delete(cacheKey);
+    }
+
+    // PASO A: Cache en memoria
+    if (!forceCreate && folderIdCache.has(cacheKey)) {
+      currentParentId = folderIdCache.get(cacheKey);
+      continue;
+    }
+
+    // Candado de concurrencia para evitar condiciones de carrera en subidas múltiples
+    if (pendingFolderPromises.has(cacheKey)) {
+      currentParentId = await pendingFolderPromises.get(cacheKey);
+      continue;
+    }
+
+    const parentForThisSegment = currentParentId;
+    const segmentPath = accumulatedPath;
+    const shouldForceSegmentCreate = forceCreate && idx === parts.length - 1;
+
+    const resolveSegmentPromise = (async () => {
+      if (!shouldForceSegmentCreate) {
+        // PASO B: Inferir el ID desde archivos hermanos o carpetas ya existentes en el proyecto
+        if (Array.isArray(projectFiles) && projectFiles.length > 0) {
+          for (const file of projectFiles) {
+            if (!file) continue;
+            const rawFilePath = (file.path || file.name || '')
+              .replace(/^\.+\//, '')
+              .replace(/^\/+/, '')
+              .trim();
+            if (!rawFilePath) continue;
+
+            const isFolderEntry =
+              file.mimeType === 'application/vnd.google-apps.folder' || file.isFolder;
+            if (isFolderEntry && rawFilePath === segmentPath && isValidDriveId(file.id)) {
+              const folderId = file.id.trim();
+              folderIdCache.set(cacheKey, folderId);
+              return folderId;
+            }
+
+            const prefix = `${segmentPath}/`;
+            if (!isFolderEntry && rawFilePath.startsWith(prefix)) {
+              const remainder = rawFilePath.slice(prefix.length);
+              if (remainder && !remainder.includes('/')) {
+                const siblingParentId =
+                  file.parentId || (Array.isArray(file.parents) ? file.parents[0] : null);
+                if (isValidDriveId(siblingParentId) && siblingParentId.trim() !== rootId) {
+                  const resolvedId = siblingParentId.trim();
+                  folderIdCache.set(cacheKey, resolvedId);
+                  return resolvedId;
+                }
+              }
+            }
+          }
+        }
+
+        // PASO C: Búsqueda explícita en la API de Google Drive
+        if (!isSimulated) {
+          try {
+            const escapedFolderName = cleanPart.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+            const q = `'${parentForThisSegment}' in parents and name = '${escapedFolderName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+            const searchUrl = `${DRIVE_API_BASE_URL}?q=${encodeURIComponent(
+              q
+            )}&fields=${encodeURIComponent(
+              'files(id,name,parents)'
+            )}&supportsAllDrives=true&includeItemsFromAllDrives=true`;
+
+            const resp = await driveFetchWithRetry(
+              searchUrl,
+              { method: 'GET', cache: 'no-store' },
+              effectiveToken
+            );
+            if (resp.ok) {
+              const data = await resp.json();
+              if (Array.isArray(data.files) && data.files.length > 0 && isValidDriveId(data.files[0].id)) {
+                const foundId = data.files[0].id.trim();
+                folderIdCache.set(cacheKey, foundId);
+                return foundId;
+              }
+            }
+          } catch (searchErr) {
+            console.warn(`[OpenDriveTeX] Explicit Drive folder search failed for "${cleanPart}":`, searchErr);
+          }
+        }
+      }
+
+      // PASO D: Creación como último recurso (o forzada tras 404/403 de scope drive.file)
+      const created = await createDriveSubfolder(cleanPart, parentForThisSegment, effectiveToken);
+      if (created?.id) {
+        folderIdCache.set(cacheKey, created.id);
+        return created.id;
+      }
+
+      throw new Error(`Failed to resolve or create subfolder "${cleanPart}" in Google Drive.`);
+    })();
+
+    pendingFolderPromises.set(cacheKey, resolveSegmentPromise);
+    try {
+      currentParentId = await resolveSegmentPromise;
+    } finally {
+      pendingFolderPromises.delete(cacheKey);
+    }
+  }
+
+  return currentParentId;
+}
+
 /**
  * Finds or creates a subfolder hierarchy (e.g., `'output_figures'`) inside a parent folder.
  *
  * @param {string} parentFolderId - Top-level Google Drive project folder ID.
  * @param {string} relativePath - Folder path segment (e.g. `'output_figures'`).
  * @param {string} [accessToken] - OAuth 2.0 Bearer token.
+ * @param {Array<any>} [projectFiles=[]] - Optional loaded project files for sibling parent inference.
  * @returns {Promise<string>} The target Google Drive folder ID.
  */
-export async function getOrCreateDriveSubfolderPath(parentFolderId, relativePath, accessToken) {
-  if (!isValidDriveId(parentFolderId)) {
-    return parentFolderId;
-  }
-  const cleanPath = (relativePath || '').replace(/^\/+|\/+$/g, '').trim();
-  if (!cleanPath) {
-    return parentFolderId;
-  }
-
-  const parts = cleanPath.split('/').filter(Boolean);
-  let currentParentId = parentFolderId.trim();
-
-  for (const part of parts) {
-    const cleanPart = part.trim();
-    if (!cleanPart) continue;
-
-    // Check if subfolder already exists inside current parent
-    try {
-      const files = await listAndFetchDriveFolderFiles(currentParentId, accessToken);
-      const existing = files.find(
-        (f) =>
-          f.name === cleanPart &&
-          (f.mimeType === 'application/vnd.google-apps.folder' || f.isFolder)
-      );
-      if (existing?.id) {
-        currentParentId = existing.id;
-        continue;
-      }
-    } catch {
-      // If listing fails, proceed to create
-    }
-
-    const created = await createDriveSubfolder(cleanPart, currentParentId, accessToken);
-    currentParentId = created.id;
-  }
-
-  return currentParentId;
+export async function getOrCreateDriveSubfolderPath(
+  parentFolderId,
+  relativePath,
+  accessToken,
+  projectFiles = []
+) {
+  return resolveOrCreateSubfolderId(parentFolderId, relativePath, projectFiles, accessToken);
 }
 
 /**
@@ -2163,7 +2359,7 @@ export async function listAndFetchDriveFolderFiles(folderId, accessToken) {
   }
 
   const query = encodeURIComponent(`'${cleanFolderId}' in parents and trashed = false`);
-  const fields = encodeURIComponent('files(id,name,mimeType,modifiedTime,size,trashed)');
+  const fields = encodeURIComponent('files(id,name,mimeType,modifiedTime,size,trashed,parents)');
   const url = `${DRIVE_API_BASE_URL}?q=${query}&fields=${fields}&orderBy=name&pageSize=100&supportsAllDrives=true&includeItemsFromAllDrives=true&_t=${Date.now()}`;
 
   const response = await driveFetchWithRetry(url, {
@@ -2330,114 +2526,153 @@ export async function uploadAuxFileToDriveFolder({
   content,
   mimeType = 'application/octet-stream',
   accessToken,
+  projectFiles = [],
 }) {
-  const { isSimulated } = await getAuthContext(accessToken);
-  const validFolderId = isValidDriveId(folderId) ? folderId.trim() : undefined;
-  const cleanFileName = (fileName || 'asset.dat').replace(/^\.+\//, '').trim();
+  console.log('[Drive Upload] Starting upload for:', fileName, 'in folderId:', folderId);
+  try {
+    const { isSimulated } = await getAuthContext(accessToken);
+    const validFolderId = isValidDriveId(folderId) ? folderId.trim() : undefined;
+    const cleanFileName = (fileName || 'asset.dat').replace(/^\.+\//, '').trim();
 
-  // If the path contains subfolders (e.g. output_figures/fig1.png), resolve the leaf file name
-  // and ensure the subfolder hierarchy exists in Google Drive
-  let targetFolderId = validFolderId;
-  let leafFileName = cleanFileName;
+    // If the path contains subfolders (e.g. output_figures/fig1.png), resolve the leaf file name
+    // and ensure the subfolder hierarchy exists in Google Drive without creating duplicates
+    let targetFolderId = validFolderId;
+    let leafFileName = cleanFileName;
+    let subfolderRelPath = '';
 
-  if (cleanFileName.includes('/')) {
-    const parts = cleanFileName.split('/');
-    leafFileName = parts.pop();
-    const subfolderRelPath = parts.join('/');
-    if (validFolderId && !isSimulated) {
-      targetFolderId = await getOrCreateDriveSubfolderPath(validFolderId, subfolderRelPath, accessToken);
+    if (cleanFileName.includes('/')) {
+      const parts = cleanFileName.split('/');
+      leafFileName = parts.pop();
+      subfolderRelPath = parts.join('/');
+      if (validFolderId && !isSimulated) {
+        targetFolderId = await resolveOrCreateSubfolderId(
+          validFolderId,
+          subfolderRelPath,
+          projectFiles,
+          accessToken
+        );
+      }
     }
-  }
 
-  if (isSimulated && validFolderId) {
-    const key = `opendrivetex_sim_folder_files_${validFolderId}`;
-    const existingRaw = localStorage.getItem(key);
-    const existing = existingRaw ? JSON.parse(existingRaw) : [];
-    const nowIso = new Date().toISOString();
+    if (isSimulated && validFolderId) {
+      const key = `opendrivetex_sim_folder_files_${validFolderId}`;
+      const existingRaw = localStorage.getItem(key);
+      const existing = existingRaw ? JSON.parse(existingRaw) : [];
+      const nowIso = new Date().toISOString();
 
-    const serializedContent =
-      content instanceof Uint8Array
-        ? `BINARY_IMAGE_${cleanFileName}_${content.byteLength}_BYTES`
-        : typeof content === 'string'
-        ? content
-        : 'BINARY_ASSET';
+      const serializedContent =
+        content instanceof Uint8Array
+          ? `BINARY_IMAGE_${cleanFileName}_${content.byteLength}_BYTES`
+          : typeof content === 'string'
+          ? content
+          : 'BINARY_ASSET';
 
-    const existingIdx = existing.findIndex((f) => f.path === cleanFileName || f.name === cleanFileName);
-    const record = {
-      id: existingIdx >= 0 ? existing[existingIdx].id : `sim_aux_${Date.now()}`,
-      name: leafFileName,
-      path: cleanFileName,
-      mimeType,
-      modifiedTime: nowIso,
-      content: serializedContent,
+      const existingIdx = existing.findIndex((f) => f.path === cleanFileName || f.name === cleanFileName);
+      const record = {
+        id: existingIdx >= 0 ? existing[existingIdx].id : `sim_aux_${Date.now()}`,
+        name: leafFileName,
+        path: cleanFileName,
+        mimeType,
+        modifiedTime: nowIso,
+        content: serializedContent,
+      };
+
+      if (existingIdx >= 0) {
+        existing[existingIdx] = record;
+      } else {
+        existing.push(record);
+      }
+
+      localStorage.setItem(key, JSON.stringify(existing));
+      return record;
+    }
+
+    // 1. Create file metadata inside target parent/subfolder
+    const createFileMetadata = async (parentId) => {
+      const metaBody = {
+        name: leafFileName,
+        mimeType,
+      };
+      if (parentId) {
+        metaBody.parents = [parentId];
+      }
+      return driveFetchWithRetry(
+        `${DRIVE_API_BASE_URL}?fields=id,name,mimeType,modifiedTime,parents&supportsAllDrives=true`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+          },
+          body: JSON.stringify(metaBody),
+        },
+        accessToken
+      );
     };
 
-    if (existingIdx >= 0) {
-      existing[existingIdx] = record;
-    } else {
-      existing.push(record);
+    let metaResponse = await createFileMetadata(targetFolderId);
+
+    // Fallback obligatorio ante 404/403 de scope drive.file cuando la subcarpeta existente
+    // fue creada fuera de la app y no fue autorizada explícitamente en el Picker
+    if (
+      !metaResponse.ok &&
+      (metaResponse.status === 404 || metaResponse.status === 403) &&
+      subfolderRelPath &&
+      validFolderId &&
+      !isSimulated
+    ) {
+      console.warn(
+        `[Drive Upload] Subfolder "${subfolderRelPath}" (${targetFolderId}) returned HTTP ${metaResponse.status} under drive.file; creating app-owned subfolder and retrying.`
+      );
+      folderIdCache.delete(`${validFolderId}/${subfolderRelPath}`);
+      targetFolderId = await resolveOrCreateSubfolderId(
+        validFolderId,
+        subfolderRelPath,
+        projectFiles,
+        accessToken,
+        true
+      );
+      metaResponse = await createFileMetadata(targetFolderId);
     }
 
-    localStorage.setItem(key, JSON.stringify(existing));
-    return record;
-  }
+    if (!metaResponse.ok) {
+      const errText = await metaResponse.text().catch(() => '');
+      throw new Error(`Failed to create auxiliary file metadata (${metaResponse.status}): ${errText}`);
+    }
 
-  // 1. Create file metadata inside target parent/subfolder
-  const metaBody = {
-    name: leafFileName,
-    mimeType,
-  };
-  if (targetFolderId) {
-    metaBody.parents = [targetFolderId];
-  }
+    const createdMeta = await metaResponse.json();
 
-  const metaResponse = await driveFetchWithRetry(
-    `${DRIVE_API_BASE_URL}?fields=id,name,mimeType,modifiedTime&supportsAllDrives=true`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json; charset=utf-8',
+    // 2. Upload file content via media PATCH
+    const uploadUrl = `${DRIVE_UPLOAD_BASE_URL}/${encodeURIComponent(
+      createdMeta.id
+    )}?uploadType=media&fields=id,name,mimeType,modifiedTime,parents&supportsAllDrives=true`;
+
+    const uploadResponse = await driveFetchWithRetry(
+      uploadUrl,
+      {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': mimeType,
+        },
+        body: content,
       },
-      body: JSON.stringify(metaBody),
-    },
-    accessToken
-  );
+      accessToken
+    );
 
-  if (!metaResponse.ok) {
-    const errText = await metaResponse.text().catch(() => '');
-    throw new Error(`Failed to create auxiliary file metadata (${metaResponse.status}): ${errText}`);
+    if (!uploadResponse.ok) {
+      const errText = await uploadResponse.text().catch(() => '');
+      throw new Error(`Failed to upload auxiliary file media (${uploadResponse.status}): ${errText}`);
+    }
+
+    const finalMeta = await uploadResponse.json();
+    return {
+      ...finalMeta,
+      name: leafFileName,
+      path: cleanFileName,
+    };
+  } catch (err) {
+    console.error('[Drive Upload Error]:', err);
+    throw err;
   }
-
-  const createdMeta = await metaResponse.json();
-
-  // 2. Upload file content via media PATCH
-  const uploadUrl = `${DRIVE_UPLOAD_BASE_URL}/${encodeURIComponent(
-    createdMeta.id
-  )}?uploadType=media&fields=id,name,mimeType,modifiedTime&supportsAllDrives=true`;
-
-  const uploadResponse = await driveFetchWithRetry(
-    uploadUrl,
-    {
-      method: 'PATCH',
-      headers: {
-        'Content-Type': mimeType,
-      },
-      body: content,
-    },
-    accessToken
-  );
-
-  if (!uploadResponse.ok) {
-    const errText = await uploadResponse.text().catch(() => '');
-    throw new Error(`Failed to upload auxiliary file media (${uploadResponse.status}): ${errText}`);
-  }
-
-  const finalMeta = await uploadResponse.json();
-  return {
-    ...finalMeta,
-    name: leafFileName,
-    path: cleanFileName,
-  };
 }
 
 // ============================================================================

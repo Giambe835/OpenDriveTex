@@ -47,6 +47,7 @@ import {
 } from './utils/reviewMacroUtils';
 import {
   createCollabSession,
+  getDeterministicRoomName,
   getRoomFromUrlHash,
   setRoomInUrlHash,
 } from './services/collabService';
@@ -76,9 +77,12 @@ import {
   openGoogleDrivePicker,
   parseDriveOpenWithStateFromUrl,
   clearPendingDriveOpenWithState,
+  refreshTokenFromUserGesture,
+  resolveOrCreateSubfolderId,
   scanTexDependencies,
   signOutGoogleDrive,
   trashDriveFile,
+  tryProactiveRefreshOnUserActivity,
   updateDriveFileContent,
   uploadAuxFileToDriveFolder,
 } from './services/driveService';
@@ -388,6 +392,11 @@ export default function App() {
     counts: { comments: 0, additions: 0, deletions: 0, total: 0 },
   });
 
+  const [isSessionExpired, setIsSessionExpired] = useState(false);
+  const [isReconnecting, setIsReconnecting] = useState(false);
+  const isSessionExpiredRef = useRef(false);
+  isSessionExpiredRef.current = isSessionExpired;
+
   /**
    * Dedicated background Web Worker reference (`src/workers/latex.worker.js`).
    * @type {React.MutableRefObject<Worker | null>}
@@ -432,6 +441,12 @@ export default function App() {
    * @type {React.MutableRefObject<boolean>}
    */
   const canWriteDriveFileRef = useRef(false);
+
+  /**
+   * Tracks the latest Drive modifiedTime timestamp in milliseconds to prevent stale closure comparison loops.
+   * @type {React.MutableRefObject<number | null>}
+   */
+  const lastSavedAtRef = useRef(null);
 
   /**
    * Tracks the latest `manualSaveRequestedAt` timestamp handled by the Leader tab.
@@ -702,9 +717,6 @@ export default function App() {
     const handleHashChange = () => {
       const nextRoom = getRoomFromUrlHash();
       setRoomName(nextRoom);
-      if (isValidDriveId(nextRoom)) {
-        setDriveFolderId(nextRoom);
-      }
     };
 
     window.addEventListener('hashchange', handleHashChange);
@@ -713,9 +725,9 @@ export default function App() {
     };
   }, []);
 
-  // 3. Initialize and tear down the Yjs + WebRTC + IndexedDB session ONLY when a valid `roomName` (folderId) is active
+  // 3. Initialize and tear down the Yjs + WebRTC + IndexedDB session when a room is active
   useEffect(() => {
-    if (!roomName || !isValidDriveId(roomName)) {
+    if (!roomName || typeof roomName !== 'string' || !roomName.trim()) {
       setCollabSession(null);
       setAuxFiles([]);
       setPdfBuffer(null);
@@ -727,6 +739,7 @@ export default function App() {
     const currentProfile = getAuthenticatedUserProfile();
     const session = createCollabSession({
       roomName,
+      projectName: driveFolderName || driveFileName || roomName,
       hasDriveToken: hasToken,
       userProfile: currentProfile || undefined,
     });
@@ -872,11 +885,14 @@ export default function App() {
     const unregisterAutoSave = session.registerLeaderAutoSave({
       isDriveFileLinked: () =>
         Boolean(
-          isValidDriveId(
-            driveFileIdRef.current || session.projectMeta?.get('mainTexFileId')
-          ) && getValidAccessToken()
+          !isSessionExpiredRef.current &&
+            isValidDriveId(
+              driveFileIdRef.current || session.projectMeta?.get('mainTexFileId')
+            ) &&
+            getValidAccessToken()
         ),
       onDirtyStateChange: ({ isDirty, nextAutoSaveAt: scheduledAt }) => {
+        if (isSessionExpiredRef.current) return;
         if (isDirty) {
           setDriveSaveStatus('dirty');
           setNextAutoSaveAt(scheduledAt);
@@ -885,6 +901,7 @@ export default function App() {
         }
       },
       onLeaderAutoSave: async () => {
+        if (isSessionExpiredRef.current) return;
         if (executeLeaderDrivePatchRef.current) {
           await executeLeaderDrivePatchRef.current(session);
         }
@@ -943,13 +960,43 @@ export default function App() {
           setDriveFileName(mainTexName);
           setActiveFile(mainTexName);
         }
-      } else if (getValidAccessToken() && reconcileSessionWithDriveFolderRef.current) {
-        // Page reload with an existing `#room=<folderId>` hash:
-        // Always query Google Drive (`files.list` with `trashed=false` and `Cache-Control: no-cache`)
-        // to fetch the absolute latest file state directly from Google Drive API (Drive-first, no stale local cache)
-        await reconcileSessionWithDriveFolderRef.current(session, roomName, null, {
-          forceOverwriteText: true,
-        });
+      } else if (getValidAccessToken()) {
+        // Page reload with an existing `#room=<fileId>` hash:
+        // Query Google Drive to fetch the latest state directly from Google Drive API
+        try {
+          const meta = await fetchDriveFileMetadata(roomName);
+          if (meta.mimeType === 'application/vnd.google-apps.folder') {
+            if (reconcileSessionWithDriveFolderRef.current) {
+              await reconcileSessionWithDriveFolderRef.current(session, roomName, null, {
+                forceOverwriteText: true,
+              });
+            }
+          } else {
+            const rawContent = await fetchDriveFileContent(meta.id, false);
+            const resolvedName = meta.name || 'main.tex';
+            canWriteDriveFileRef.current = true;
+            setDriveFileId(meta.id);
+            setDriveFileName(resolvedName);
+            setActiveFile(resolvedName);
+            setDriveSaveStatus('saved');
+            const initialSavedMs = meta.modifiedTime
+              ? new Date(meta.modifiedTime).getTime()
+              : Date.now();
+            lastSavedAtRef.current = initialSavedMs;
+            setLastSavedAt(initialSavedMs);
+            session.updateProjectMeta({
+              mainTexFileId: meta.id,
+              mainTexFileName: resolvedName,
+            });
+            session.replaceDocumentFromDrive(rawContent, true);
+          }
+        } catch {
+          if (reconcileSessionWithDriveFolderRef.current) {
+            await reconcileSessionWithDriveFolderRef.current(session, roomName, null, {
+              forceOverwriteText: true,
+            });
+          }
+        }
       }
 
       syncProjectMeta();
@@ -1184,8 +1231,11 @@ export default function App() {
         const mainTexFile =
           texFiles.find((f) => f.name.toLowerCase() === 'main.tex') || texFiles[0] || null;
 
-        // Rule #1: Always unify the Yjs room ID by the shared `folderId` (NEVER `mainTexFile.id`)
-        const targetRoomId = cleanFolderId;
+        // Shared deterministic room name based on project folder or main .tex name
+        // (avoiding user-specific Google Drive IDs so all collaborators join the same WebRTC room).
+        const targetRoomId = getDeterministicRoomName(
+          resolvedFolderName || (mainTexFile ? mainTexFile.name : null) || cleanFolderId
+        );
 
         if (mainTexFile) {
           // User has direct `drive.file` visibility of `main.tex` inside this folder
@@ -1195,6 +1245,11 @@ export default function App() {
           const mainTexContent =
             typeof mainTexFile.content === 'string' ? mainTexFile.content : '';
           const mainName = mainTexFile.name || 'main.tex';
+          const initialSavedMs = mainTexFile.modifiedTime
+            ? new Date(mainTexFile.modifiedTime).getTime()
+            : Date.now();
+          lastSavedAtRef.current = initialSavedMs;
+          setLastSavedAt(initialSavedMs);
 
           setDriveFileId(mainTexFile.id);
           setDriveFileName(mainName);
@@ -1347,12 +1402,16 @@ export default function App() {
         setActiveFile(resolvedName);
         setDriveSaveStatus('saved');
 
-        // Unify room by parent folder ID (`parents[0]`) when available so folder collaborators share the same room
+        const initialSavedMs = metadata.modifiedTime
+          ? new Date(metadata.modifiedTime).getTime()
+          : Date.now();
+        lastSavedAtRef.current = initialSavedMs;
+        setLastSavedAt(initialSavedMs);
+
         let siblingAuxFiles = [];
         let folderFiles = [];
         let resolvedFolderName = '';
         const parentId = Array.isArray(metadata.parents) ? metadata.parents[0] : null;
-        const targetRoomId = isValidDriveId(parentId) ? parentId : metadata.id;
 
         if (isValidDriveId(parentId)) {
           setDriveFolderId(parentId);
@@ -1379,6 +1438,11 @@ export default function App() {
           }
         }
 
+        // Shared deterministic room name based on parent folder or .tex file name
+        const targetRoomId = getDeterministicRoomName(
+          resolvedFolderName || metadata.name || 'project'
+        );
+
         if (collabSessionRef.current && collabSessionRef.current.roomName === targetRoomId) {
           collabSessionRef.current.updateLocalUserProfile({ canWriteDriveFile: true });
           collabSessionRef.current.updateProjectMeta({
@@ -1397,7 +1461,7 @@ export default function App() {
             mainTexFileId: metadata.id,
             mainTexContent: rawContent,
             mainTexName: resolvedName,
-            folderId: isValidDriveId(parentId) ? parentId : targetRoomId,
+            folderId: isValidDriveId(parentId) ? parentId : undefined,
             folderName: resolvedFolderName || undefined,
             auxFiles: siblingAuxFiles,
             folderFiles: folderFiles.length > 0 ? folderFiles : undefined,
@@ -1650,9 +1714,18 @@ export default function App() {
             setActiveFile(mainTex.name);
             setDriveSaveStatus('saved');
 
+            const initialSavedMs = mainTex.modifiedTime
+              ? new Date(mainTex.modifiedTime).getTime()
+              : Date.now();
+            lastSavedAtRef.current = initialSavedMs;
+            setLastSavedAt(initialSavedMs);
+
+            const folderName = driveFolderName || pickedFolders[0]?.name || null;
+            const targetRoomId = getDeterministicRoomName(folderName || mainTex.name || 'project');
+
             if (
               collabSessionRef.current &&
-              collabSessionRef.current.roomName === resolvedFolderId
+              collabSessionRef.current.roomName === targetRoomId
             ) {
               collabSessionRef.current.updateLocalUserProfile({ canWriteDriveFile: true });
               collabSessionRef.current.updateProjectMeta({
@@ -1691,22 +1764,25 @@ export default function App() {
                 pendingSaveAfterPickerRef.current = false;
                 try {
                   setDriveSaveStatus('saving');
-                  await updateDriveFileContent(
+                  const updateRes = await updateDriveFileContent(
                     mainTex.id,
                     collabSessionRef.current.ytext.toString()
                   );
-                  const now = Date.now();
-                  setLastSavedAt(now);
+                  const savedTimeMs = updateRes?.modifiedTime
+                    ? new Date(updateRes.modifiedTime).getTime()
+                    : Date.now();
+                  lastSavedAtRef.current = savedTimeMs;
+                  setLastSavedAt(savedTimeMs);
                   setDriveSaveStatus('saved');
                   setNextAutoSaveAt(null);
-                  collabSessionRef.current.broadcastDriveSaveTimestamp(now);
+                  collabSessionRef.current.broadcastDriveSaveTimestamp(savedTimeMs);
                 } catch {
                   // Ignore follow-up error if already handled
                 }
               }
-            } else if (isValidDriveId(resolvedFolderId)) {
+            } else {
               pendingRoomHydrationRef.current = {
-                roomId: resolvedFolderId,
+                roomId: targetRoomId,
                 mainTexFileId: mainTex.id,
                 mainTexContent: mainTex.content || '',
                 mainTexName: mainTex.name,
@@ -1716,7 +1792,7 @@ export default function App() {
                 canWriteDriveFile: true,
                 forceOverwrite: true,
               };
-              setRoomInUrlHash(resolvedFolderId);
+              setRoomInUrlHash(targetRoomId);
             }
           } else if (collabSessionRef.current && auxItems.length > 0) {
             collabSessionRef.current.mergeFolderAuxFiles(auxItems);
@@ -1785,15 +1861,36 @@ export default function App() {
         }
       }
 
-      const targetRoomId = isValidDriveId(parentFolderId) ? parentFolderId : pickedTex.id;
+      let parentFolderName = '';
+      if (isValidDriveId(parentFolderId)) {
+        try {
+          const parentMeta = await fetchDriveFileMetadata(parentFolderId);
+          if (parentMeta?.name) {
+            parentFolderName = parentMeta.name;
+          }
+        } catch {
+          // Keep existing parentFolderId
+        }
+      }
+
+      // Shared deterministic room name based on parent folder or .tex file name
+      const targetRoomId = getDeterministicRoomName(parentFolderName || pickedTex.name || 'project');
 
       canWriteDriveFileRef.current = true;
       setSharedFolderNeedsFilePicker(false);
       setDriveFileId(pickedTex.id);
       setDriveFileName(resolvedName);
       setActiveFile(resolvedName);
-      setDriveFolderId(targetRoomId);
+      if (isValidDriveId(parentFolderId)) {
+        setDriveFolderId(parentFolderId);
+      }
       setDriveSaveStatus('saved');
+
+      const initialSavedMs = pickedTex.modifiedTime
+        ? new Date(pickedTex.modifiedTime).getTime()
+        : Date.now();
+      lastSavedAtRef.current = initialSavedMs;
+      setLastSavedAt(initialSavedMs);
 
       let siblingAuxFiles = [];
       if (isValidDriveId(parentFolderId)) {
@@ -1811,7 +1908,7 @@ export default function App() {
         collabSessionRef.current.updateProjectMeta({
           mainTexFileId: pickedTex.id,
           mainTexFileName: resolvedName,
-          folderId: targetRoomId,
+          folderId: isValidDriveId(parentFolderId) ? parentFolderId : undefined,
         });
         collabSessionRef.current.replaceDocumentFromDrive(rawContent, true);
         if (siblingAuxFiles.length > 0) {
@@ -1823,7 +1920,7 @@ export default function App() {
           mainTexFileId: pickedTex.id,
           mainTexContent: rawContent,
           mainTexName: resolvedName,
-          folderId: targetRoomId,
+          folderId: isValidDriveId(parentFolderId) ? parentFolderId : undefined,
           auxFiles: siblingAuxFiles,
           canWriteDriveFile: true,
           forceOverwrite: true,
@@ -1960,7 +2057,7 @@ export default function App() {
       if (!cleanPath) return;
 
       try {
-        await createDriveSubfolder(cleanPath, driveFolderId);
+        await resolveOrCreateSubfolderId(driveFolderId, cleanPath, driveFolderFilesRef.current || []);
         if (latexWorkerRef.current) {
           latexWorkerRef.current.postMessage({
             type: 'MKDIR_MEMFS',
@@ -2021,16 +2118,23 @@ export default function App() {
         setActiveFile(cleanName);
 
         if (isValidDriveId(driveFolderId) && getValidAccessToken()) {
+          const projectFilesSnapshot = [
+            ...(driveFolderFilesRef.current || []),
+            ...(currentSession.getAuxFilesForMemFS ? currentSession.getAuxFilesForMemFS() : []),
+          ];
           const uploadedMeta = await uploadAuxFileToDriveFolder({
             folderId: driveFolderId,
             fileName: cleanName,
             content,
             mimeType: resolvedMimeType || 'application/octet-stream',
+            projectFiles: projectFilesSnapshot,
           });
 
           if (uploadedMeta?.id) {
             currentSession.upsertAuxFile({
               id: uploadedMeta.id,
+              parentId: Array.isArray(uploadedMeta.parents) ? uploadedMeta.parents[0] : undefined,
+              parents: uploadedMeta.parents,
               name: cleanName.split('/').pop(),
               path: cleanName,
               mimeType: uploadedMeta.mimeType || resolvedMimeType,
@@ -2041,6 +2145,7 @@ export default function App() {
           }
         }
       } catch (err) {
+        console.error('[Drive Upload Error]:', err);
         setDriveError(err?.message || `Failed to upload auxiliary file "${file.name}".`);
       }
     },
@@ -2189,12 +2294,14 @@ export default function App() {
         setDriveFileId(created.id);
         setDriveFileName(resolvedName);
         setActiveFile(resolvedName);
-        setLastSavedAt(now);
+        const createdMs = created.modifiedTime ? new Date(created.modifiedTime).getTime() : now;
+        lastSavedAtRef.current = createdMs;
+        setLastSavedAt(createdMs);
         setDriveSaveStatus('saved');
         setNextAutoSaveAt(null);
 
-        // Rule #1: Always keep the room ID unified by `driveFolderId` when inside a folder
-        const targetRoomId = isValidDriveId(driveFolderId) ? driveFolderId : created.id;
+        // Shared deterministic room name based on folder or newly created .tex file
+        const targetRoomId = getDeterministicRoomName(driveFolderName || resolvedName);
 
         if (currentSession && currentSession.roomName === targetRoomId) {
           currentSession.updateLocalUserProfile({ canWriteDriveFile: true });
@@ -2203,14 +2310,14 @@ export default function App() {
             mainTexFileName: resolvedName,
             folderId: isValidDriveId(driveFolderId) ? driveFolderId : undefined,
           });
-          currentSession.broadcastDriveSaveTimestamp(now);
+          currentSession.broadcastDriveSaveTimestamp(createdMs);
         } else {
           pendingRoomHydrationRef.current = {
             roomId: targetRoomId,
             mainTexFileId: created.id,
             mainTexContent: currentTex,
             mainTexName: resolvedName,
-            folderId: isValidDriveId(driveFolderId) ? driveFolderId : targetRoomId,
+            folderId: isValidDriveId(driveFolderId) ? driveFolderId : undefined,
             auxFiles: [],
             canWriteDriveFile: true,
             forceOverwrite: false,
@@ -2279,11 +2386,16 @@ export default function App() {
         setActiveFile(cleanName);
 
         if (isValidDriveId(driveFolderId) && getValidAccessToken()) {
+          const projectFilesSnapshot = [
+            ...(driveFolderFilesRef.current || []),
+            ...(currentSession.getAuxFilesForMemFS ? currentSession.getAuxFilesForMemFS() : []),
+          ];
           const uploaded = await uploadAuxFileToDriveFolder({
             folderId: driveFolderId,
             fileName: cleanName,
             content: starterContent,
             mimeType,
+            projectFiles: projectFilesSnapshot,
           });
           if (uploaded?.id) {
             currentSession.upsertAuxFile({
@@ -2298,6 +2410,7 @@ export default function App() {
           }
         }
       } catch (err) {
+        console.error('[Drive Upload Error]:', err);
         setDriveError(err?.message || `Failed to create file "${cleanName}".`);
       }
     },
@@ -2313,7 +2426,7 @@ export default function App() {
   const executeLeaderDrivePatch = useCallback(
     async (sessionOverride) => {
       const currentSession = sessionOverride || collabSessionRef.current;
-      if (!currentSession || !getValidAccessToken()) return;
+      if (!currentSession || isSessionExpiredRef.current || !getValidAccessToken()) return;
 
       const currentFileId =
         driveFileIdRef.current || currentSession.projectMeta?.get('mainTexFileId');
@@ -2323,7 +2436,7 @@ export default function App() {
         setDriveError(null);
         setDriveSaveStatus('idle');
         setPickerToastMessage(
-          'Please click main.tex in the Google Picker once to grant save permission to your account.'
+          'Please select main.tex in the Google Drive window to grant edit access to this document.'
         );
         pendingSaveAfterPickerRef.current = true;
         handleOpenGooglePicker('files');
@@ -2333,19 +2446,48 @@ export default function App() {
       try {
         setDriveSaveStatus('saving');
         setDriveError(null);
-        await updateDriveFileContent(currentFileId, currentSession.ytext.toString());
-        const now = Date.now();
+
+        // Check for external Drive modifications before overwriting if no other peers are connected
+        const currentSavedBaseline = lastSavedAtRef.current ?? lastSavedAt;
+        if (currentSavedBaseline && currentSession.awareness) {
+          const peers = Array.from(currentSession.awareness.getStates().values()).filter(
+            (state) => state?.user && state.user.clientId !== currentSession.ydoc.clientID
+          );
+          if (peers.length === 0) {
+            try {
+              const remoteMeta = await fetchDriveFileMetadata(currentFileId);
+              if (remoteMeta && remoteMeta.modifiedTime) {
+                const remoteModifiedMs = new Date(remoteMeta.modifiedTime).getTime();
+                // If remote modifiedTime is newer than our last known save by more than 5 seconds
+                if (remoteModifiedMs > currentSavedBaseline + 5000) {
+                  console.warn(
+                    `[OpenDriveTeX] External modification detected in Google Drive (${remoteMeta.modifiedTime} > ${new Date(currentSavedBaseline).toISOString()}); proceeding with save.`
+                  );
+                }
+              }
+            } catch {
+              // Ignore metadata pre-check errors and continue with save attempt
+            }
+          }
+        }
+
+        const updateRes = await updateDriveFileContent(currentFileId, currentSession.ytext.toString());
+        const savedTimeMs = updateRes?.modifiedTime
+          ? new Date(updateRes.modifiedTime).getTime()
+          : Date.now();
         canWriteDriveFileRef.current = true;
         currentSession.updateLocalUserProfile({ canWriteDriveFile: true });
-        setLastSavedAt(now);
+        lastSavedAtRef.current = savedTimeMs;
+        setLastSavedAt(savedTimeMs);
         setDriveSaveStatus('saved');
         setNextAutoSaveAt(null);
         setPickerToastMessage(null);
-        currentSession.broadcastDriveSaveTimestamp(now);
+        currentSession.broadcastDriveSaveTimestamp(savedTimeMs);
       } catch (err) {
         const is404 =
           err?.status === 404 ||
           String(err?.message || '').includes('404') ||
+          String(err?.message || '').includes('grant edit access') ||
           String(err?.message || '').includes('grant save permission');
 
         if (is404) {
@@ -2365,15 +2507,25 @@ export default function App() {
 
           setDriveSaveStatus('idle');
           setPickerToastMessage(
-            'Please click main.tex in the Google Picker once to grant save permission to your account.'
+            'Please select main.tex in the Google Drive window to grant edit access to this document.'
           );
           pendingSaveAfterPickerRef.current = true;
           handleOpenGooglePicker('files');
           return;
         }
 
+        if (err?.message === 'SESSION_EXPIRED') {
+          setDriveSaveStatus('idle');
+          return;
+        }
+
         setDriveSaveStatus('error');
-        setDriveError(err?.message || 'Save to Google Drive failed.');
+        setDriveError(
+          `${err?.message || 'Save to Google Drive failed.'} Your changes remain safely preserved locally in IndexedDB; you can retry saving.`
+        );
+      } finally {
+        // Ensure UI is never left permanently stuck in 'saving' state
+        setDriveSaveStatus((prev) => (prev === 'saving' ? 'idle' : prev));
       }
     },
     [handleOpenGooglePicker]
@@ -2390,8 +2542,9 @@ export default function App() {
    * - If the current tab IS the Elected Leader, executes `executeLeaderDrivePatch` directly.
    */
   const handleManualSaveToDrive = useCallback(async () => {
+    tryProactiveRefreshOnUserActivity();
     const currentSession = collabSessionRef.current;
-    if (!currentSession) return;
+    if (!currentSession || isSessionExpiredRef.current) return;
 
     const election = currentSession.getLeaderElectionState();
 
@@ -2404,9 +2557,89 @@ export default function App() {
       return;
     }
 
-    if (!getValidAccessToken()) return;
+    if (!getValidAccessToken()) {
+      if (isDriveAuthenticated) {
+        isSessionExpiredRef.current = true;
+        setIsSessionExpired(true);
+      } else {
+        setDriveError('Please sign in with Google Drive to save.');
+      }
+      return;
+    }
     await executeLeaderDrivePatch(currentSession);
-  }, [executeLeaderDrivePatch]);
+  }, [executeLeaderDrivePatch, isDriveAuthenticated]);
+
+  // Listen for OAuth2 session expiration events and renew proactively on real user pointer activity
+  useEffect(() => {
+    const handleSessionExpired = () => {
+      isSessionExpiredRef.current = true;
+      setIsSessionExpired(true);
+      setNextAutoSaveAt(null);
+    };
+
+    const handleGlobalPointerDown = () => {
+      if (!isSessionExpiredRef.current) {
+        tryProactiveRefreshOnUserActivity();
+      }
+    };
+
+    window.addEventListener('opendrivetex:session-expired', handleSessionExpired);
+    window.addEventListener('pointerdown', handleGlobalPointerDown);
+    return () => {
+      window.removeEventListener('opendrivetex:session-expired', handleSessionExpired);
+      window.removeEventListener('pointerdown', handleGlobalPointerDown);
+    };
+  }, []);
+
+  const handleReconnectAndReloadFromDrive = useCallback(async () => {
+    setIsReconnecting(true);
+    try {
+      await refreshTokenFromUserGesture();
+
+      const currentSession = collabSessionRef.current;
+      const activeFolderId =
+        (isValidDriveId(driveFolderId) ? driveFolderId : null) ||
+        (isValidDriveId(currentSession?.projectMeta?.get('folderId'))
+          ? currentSession.projectMeta.get('folderId')
+          : null);
+      const activeFileId =
+        (isValidDriveId(driveFileIdRef.current) ? driveFileIdRef.current : null) ||
+        (isValidDriveId(currentSession?.projectMeta?.get('mainTexFileId'))
+          ? currentSession.projectMeta.get('mainTexFileId')
+          : null);
+
+      if (currentSession) {
+        currentSession.setLocalDriveAuthStatus(true);
+
+        if (activeFolderId && reconcileSessionWithDriveFolderRef.current) {
+          await reconcileSessionWithDriveFolderRef.current(currentSession, activeFolderId, null, {
+            forceOverwriteText: true,
+          });
+        }
+
+        if (activeFileId) {
+          try {
+            const freshTexContent = await fetchDriveFileContent(activeFileId, false);
+            if (typeof freshTexContent === 'string') {
+              currentSession.replaceDocumentFromDrive(freshTexContent, true);
+            }
+          } catch (fileErr) {
+            console.warn('[OpenDriveTeX] Could not reload main .tex after reconnect:', fileErr);
+          }
+        }
+      }
+
+      isSessionExpiredRef.current = false;
+      setIsSessionExpired(false);
+      setDriveError(null);
+    } catch (err) {
+      setDriveError(
+        err?.message || 'No se pudo reconectar con Google Drive. Inténtalo de nuevo.'
+      );
+    } finally {
+      setIsReconnecting(false);
+    }
+  }, [driveFolderId]);
 
   /**
    * Scans target text or all project files for pending review items.
@@ -2612,6 +2845,7 @@ export default function App() {
       if (!collabSessionRef.current) return;
       if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
         e.preventDefault();
+        tryProactiveRefreshOnUserActivity();
         handleCompile();
       } else if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
         e.preventDefault();
@@ -2729,7 +2963,10 @@ export default function App() {
         onToggleSidebar={() => setIsSidebarOpen((prev) => !prev)}
         isPdfVisible={isPdfVisible}
         onTogglePdfVisible={handleTogglePdfVisible}
-        onCompile={handleCompile}
+        onCompile={() => {
+          tryProactiveRefreshOnUserActivity();
+          handleCompile();
+        }}
         isCompiling={compileStatus === 'compiling'}
         isDriveAuthenticated={isDriveAuthenticated}
         driveFileId={driveFileId}
@@ -3196,6 +3433,57 @@ export default function App() {
           }
         }}
       />
+
+      {/* Full-Screen Blocking Modal when Google Drive OAuth2 Session Expires */}
+      {isSessionExpired && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 99999,
+            background: 'rgba(0, 0, 0, 0.85)',
+            pointerEvents: 'all',
+          }}
+          className="flex items-center justify-center p-6 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="session-expired-title"
+        >
+          <div className="w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900 p-6 shadow-2xl text-center space-y-5">
+            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-400">
+              <AlertCircle className="h-6 w-6" />
+            </div>
+            <div className="space-y-2">
+              <h2 id="session-expired-title" className="text-lg font-semibold text-white">
+                Sesión de Google Drive Expirada
+              </h2>
+              <p className="text-sm text-slate-300 leading-relaxed">
+                La sesión de Google Drive ha expirado por inactividad. Para evitar sobrescribir cambios de otros colaboradores, reconecta tu cuenta para recargar la última versión del proyecto desde Google Drive antes de continuar editando.
+              </p>
+            </div>
+            {driveError && (
+              <div className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+                {driveError}
+              </div>
+            )}
+            <button
+              type="button"
+              disabled={isReconnecting}
+              onClick={handleReconnectAndReloadFromDrive}
+              className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-indigo-600/30 transition-all cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              {isReconnecting ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  <span>Reconectando y actualizando...</span>
+                </>
+              ) : (
+                <span>Reconectar y Actualizar desde Google Drive</span>
+              )}
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
