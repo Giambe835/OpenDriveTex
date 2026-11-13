@@ -92,15 +92,26 @@ Scientific collaboration should not be gated behind artificial limits or closed 
 * **Export for Journal Submission:** Export clean `.tex` files or whole-project `.zip` archives.
 * **Pre-Flight Review Guard:** Scans the manuscript for unresolved comments (`\odtcomment`), pending insertions (`\odtadd`), or unaccepted deletions (`\odtdel`). Displays an interactive modal enabling one-click bulk resolution or jumping directly to pending review items.
 
-### 4. Drive-First Workflow & Google Drive Integration
+### 4. Drive-First Workflow, Session Protection & Smart Subfolder Sync
 * **Strict Drive Integration:** No stale local cache conflicts. The document state is fetched directly from Google Drive API on project open or reload.
 * **Google Drive "Open With":** Fully registered with Google Drive's UI Integration (`?state={"ids":[...],"action":"open"}`), letting you right-click any `.tex` file or project folder in Google Drive and open it directly in OpenDriveTeX.
 * **Google Picker API:** Open project folders, shared drives, or manuscripts via the Google Picker modal.
+* **Smart Google Drive Subfolder Synchronization:** Subfolder paths (such as `output_figures/`) are resolved by ID through an in-memory cache, sibling-file parent inference, and explicit Drive API queries with concurrency locking—preventing duplicate folders under the `drive.file` scope (with automatic app-owned subfolder fallback when an external folder returns `403`/`404`).
 * **Missing Dependency Scanner:** Automatically parses `\includegraphics{...}` and `\bibliography{...}` commands and guides you to authorize missing assets via Google Picker.
 * **Leader-Elected Auto-Save:** Connected collaborators elect a single Save Leader via Yjs Awareness to debounce saves (every 30 seconds or on `Ctrl+S`), preventing Google Drive quota throttling.
-* **Session Persistence:** OAuth credentials and profile metadata persist securely across hard browser refreshes (`F5`), keeping pending edits and session context intact.
+* **OAuth2 Session Persistence & Overwrite Protection:** OAuth credentials and profile metadata persist across browser refreshes, while active user interactions (`pointerdown`, manual save, compile) proactively renew the Google token before expiration. If a session expires after prolonged inactivity, a full-screen security modal pauses auto-save and locks editing until the user reconnects and reloads the latest project files from Google Drive—preventing accidental overwrites of collaborators' work.
 
-### 5. Context-Aware Search & Hotkeys
+### 5. Resilient Real-Time Collaboration (Yjs + Cloudflare Durable Objects)
+* **Direct WebSocket Sync over TCP 443:** Alongside P2P WebRTC, text and live remote cursors (`y-codemirror.next`) synchronize over direct WebSockets (`TCP 443`) backed by **Cloudflare Durable Objects** with **WebSocket Hibernation** (`cloudflare-signaling/`). This reliably traverses strict corporate and university firewalls without requiring UDP/TURN servers, operating 100% within Cloudflare's Free Tier.
+* **Self-Hosting Your Signaling Relay:** Any developer can deploy their own Cloudflare Worker relay in seconds:
+  ```bash
+  cd cloudflare-signaling
+  npm install
+  npx wrangler deploy
+  ```
+  Then point `VITE_WEBRTC_SIGNALING` in your `.env` to your deployed `wss://<your-worker>.workers.dev` URL.
+
+### 6. Context-Aware Search & Hotkeys
 * **Intelligent `Ctrl+F` / `Cmd+F`:** Intercepts browser search and focuses the active context:
   * **In CodeMirror:** opens the native search/replace panel (`@codemirror/search`).
   * **In PDF Preview:** routes focus to the PDF reader's search bar.
